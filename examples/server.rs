@@ -1,38 +1,45 @@
-extern crate env_logger;
-extern crate futures;
-extern crate tokio_core;
-extern crate tokio_io;
-extern crate tokio_utp;
 #[macro_use]
 extern crate unwrap;
-extern crate void;
 
-use futures::{future, Future, Stream};
-use tokio_core::reactor::Core;
-use tokio_io::AsyncRead;
-use tokio_utp::*;
-use void::Void;
+#[macro_use]
+extern crate log;
 
+use futures::StreamExt;
+use std::io;
 use std::net::SocketAddr;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio_utp::*;
 
-pub fn main() {
+#[tokio::main]
+async fn main() {
     unwrap!(::env_logger::init());
 
     // Start a simple echo server
 
     let addr: SocketAddr = unwrap!("127.0.0.1:4561".parse());
-    let mut core = unwrap!(Core::new());
-    let handle = core.handle();
-    let _: Result<(), Void> = core.run(future::lazy(|| {
-        let (_, listener) = unwrap!(UtpSocket::bind(&addr, &handle));
-        listener
-            .incoming()
-            .for_each(|stream| {
-                let (reader, writer) = stream.split();
-                tokio_io::io::copy(reader, writer).map(|_| ())
-            }).then(|res| {
-                unwrap!(res);
-                Ok(())
-            })
-    }));
+
+    let (_, listener) = unwrap!(UtpSocket::bind(&addr));
+    debug!("Listener started");
+
+    let mut incoming = listener.incoming();
+    while let Some(stream) = incoming.next().await {
+        tokio::spawn(async move {
+            if let Err(e) = handle(stream).await {
+                warn!("{}", e);
+            }
+        });
+    }
+}
+
+async fn handle(stream: io::Result<UtpStream>) -> io::Result<()> {
+    let mut stream = stream?;
+    let mut buf = vec![];
+
+    debug!("Read data from client");
+    stream.read_to_end(&mut buf).await?;
+
+    debug!("Write data to client");
+    stream.write_all(&buf).await?;
+
+    Ok(())
 }

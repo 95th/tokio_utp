@@ -1,5 +1,5 @@
 use byteorder::{BigEndian, ByteOrder};
-use bytes::{BufMut, BytesMut};
+use bytes::{Buf, BufMut, BytesMut};
 use smallvec::SmallVec;
 
 use std::fmt;
@@ -214,7 +214,7 @@ impl Packet {
 
     pub fn into_payload(mut self) -> BytesMut {
         let index = self.payload_start_index();
-        self.data.split_to(index);
+        self.data.advance(index);
         self.data
     }
 

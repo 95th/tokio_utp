@@ -1,7 +1,7 @@
 //! Queue of outgoing packets.
 
-use packet::{self, Packet};
-use {util, MAX_WINDOW_SIZE};
+use crate::packet::{self, Packet};
+use crate::{util, MAX_WINDOW_SIZE};
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};

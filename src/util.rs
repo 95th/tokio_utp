@@ -57,7 +57,7 @@ pub fn random_vec(num_bytes: usize) -> Vec<u8> {
 
 #[cfg(not(test))]
 pub fn rand<T: ::rand::Rand>() -> T {
-    use rand::{self, Rng};
+    use rand::Rng;
 
     let mut rng = rand::thread_rng();
     rng.gen::<T>()

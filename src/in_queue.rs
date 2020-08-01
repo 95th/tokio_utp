@@ -1,5 +1,5 @@
-use packet::{self, Packet};
-use {MAX_DELTA_SEQ, MAX_WINDOW_SIZE};
+use crate::packet::{self, Packet};
+use crate::{MAX_DELTA_SEQ, MAX_WINDOW_SIZE};
 
 use bytes::{Buf, BytesMut};
 

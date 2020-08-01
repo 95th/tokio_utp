@@ -1,51 +1,34 @@
-extern crate env_logger;
-extern crate futures;
-extern crate tokio_core;
-extern crate tokio_io;
-extern crate tokio_utp;
 #[macro_use]
 extern crate unwrap;
-extern crate void;
 
-use tokio_utp::*;
-
-use futures::{future, Future};
-use tokio_core::reactor::Core;
-use void::Void;
+#[macro_use]
+extern crate log;
 
 use std::net::SocketAddr;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio_utp::*;
 
-pub fn main() {
-    unwrap!(::env_logger::init());
+#[tokio::main]
+async fn main() {
+    unwrap!(env_logger::init());
 
     let local_addr: SocketAddr = unwrap!("127.0.0.1:0".parse());
     let remote_addr: SocketAddr = unwrap!("127.0.0.1:4561".parse());
 
-    let mut core = unwrap!(Core::new());
-    let handle = core.handle();
+    let (socket, _) = unwrap!(UtpSocket::bind(&local_addr));
 
-    let _: Result<(), Void> = core.run(future::lazy(|| {
-        let (socket, _) = unwrap!(UtpSocket::bind(&local_addr, &handle));
+    debug!("Connecting to the server");
+    let mut stream = unwrap!(socket.connect(&remote_addr).await);
 
-        // connect to the server
-        socket
-            .connect(&remote_addr)
-            .and_then(|stream| {
-                // send it some data
-                println!("sending \"hello world\" to server");
-                tokio_io::io::write_all(stream, "hello world").and_then(|(stream, _)| {
-                    // shutdown our the write side of the connection.
-                    tokio_io::io::shutdown(stream).and_then(|stream| {
-                        // read the stream to completion.
-                        tokio_io::io::read_to_end(stream, Vec::new()).and_then(|(_, data)| {
-                            println!("received {:?} from server", String::from_utf8(data));
-                            Ok(())
-                        })
-                    })
-                })
-            }).then(|res| {
-                unwrap!(res);
-                Ok(())
-            })
-    }));
+    debug!("Connected. send it some data");
+    unwrap!(stream.write_all(b"hello world").await);
+
+    debug!("shutdown our the write side of the connection");
+    unwrap!(stream.shutdown().await);
+
+    let mut data = vec![];
+    // read the stream to completion.
+    unwrap!(stream.read_to_end(&mut data).await);
+
+    debug!("received {:?} from server", String::from_utf8(data));
 }

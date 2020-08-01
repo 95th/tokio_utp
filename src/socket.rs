@@ -1,31 +1,49 @@
-use delays::Delays;
-use in_queue::InQueue;
-use out_queue::OutQueue;
-use packet::{self, Packet};
-use {util, TIMESTAMP_MASK};
+use crate::{
+    delays::Delays,
+    in_queue::InQueue,
+    out_queue::OutQueue,
+    packet::{self, Packet},
+    util, TIMESTAMP_MASK,
+};
 
 //use mio::net::UdpSocket;
 use arraydeque::ArrayDeque;
 use bytes::{BufMut, Bytes, BytesMut};
-use future_utils::mpsc::{self, UnboundedReceiver, UnboundedSender};
-use futures::sync::oneshot;
-use futures::{Async, AsyncSink, Future, Sink, Stream};
-use mio::{Ready, Registration, SetReadiness};
+use futures::{
+    channel::{
+        mpsc::{self, UnboundedReceiver, UnboundedSender},
+        oneshot,
+    },
+    future::FutureExt,
+    ready,
+    sink::Sink,
+    stream::{Stream, StreamExt},
+};
+use mio::{net::UdpSocket, Ready, Registration, SetReadiness};
+use slab::Slab;
+use std::{
+    cmp,
+    collections::{HashMap, VecDeque},
+    fmt,
+    future::Future,
+    io, mem,
+    net::SocketAddr,
+    pin::Pin,
+    sync::{Arc, RwLock},
+    task::{Context, Poll},
+    time::{Duration, Instant},
+    u32,
+};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, PollEvented},
+    time::{delay_until, Delay},
+};
+
 #[cfg(unix)]
 use nix::sys::socket::{getpeername, SockAddr};
-use slab::Slab;
-use tokio_core::net::UdpSocket;
-use tokio_core::reactor::{Handle, PollEvented, Remote, Timeout};
-use tokio_io::{AsyncRead, AsyncWrite};
-use void::Void;
 
-use std::collections::{HashMap, VecDeque};
-use std::net::SocketAddr;
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
-use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
-use std::{cmp, fmt, io, mem, u32};
 
 /// A uTP socket. Can be used to make outgoing connections.
 pub struct UtpSocket {
@@ -94,9 +112,6 @@ struct Inner {
     // the borrow checker happy.
     shared: Shared,
 
-    // Handle to the event loop.
-    remote: Remote,
-
     // Connection specific state
     connections: Slab<Connection>,
 
@@ -128,11 +143,13 @@ unsafe impl Send for Inner {}
 
 struct Shared {
     // The UDP socket backing everything!
-    socket: UdpSocket,
+    socket: PollEvented<UdpSocket>,
 
     // The current readiness of the socket, this is used when figuring out the
     // readiness of each connection.
     ready: Ready,
+
+    item: Option<Bytes>,
 }
 
 // Owned by UtpSocket
@@ -236,24 +253,30 @@ const MAX_DATA_SIZE: usize = 1_400 - 20;
 
 impl UtpSocket {
     /// Bind a new `UtpSocket` to the given socket address
-    pub fn bind(addr: &SocketAddr, handle: &Handle) -> io::Result<(UtpSocket, UtpListener)> {
-        UdpSocket::bind(addr, handle).and_then(|s| UtpSocket::from_socket(s, handle))
+    pub fn bind(addr: &SocketAddr) -> io::Result<(UtpSocket, UtpListener)> {
+        let socket = UdpSocket::bind(addr)?;
+        UtpSocket::from_socket(socket)
     }
 
     /// Gets the local address that the socket is bound to.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        unwrap!(self.inner.read()).shared.socket.local_addr()
+        unwrap!(self.inner.read())
+            .shared
+            .socket
+            .get_ref()
+            .local_addr()
     }
 
     /// Create a new `Utpsocket` backed by the provided `UdpSocket`.
-    pub fn from_socket(socket: UdpSocket, handle: &Handle) -> io::Result<(UtpSocket, UtpListener)> {
+    pub fn from_socket(socket: UdpSocket) -> io::Result<(UtpSocket, UtpListener)> {
         let (listener_registration, listener_set_readiness) = Registration::new2();
         let (finalize_tx, finalize_rx) = oneshot::channel();
 
-        let inner = Inner::new_shared(handle, socket, listener_set_readiness);
+        let socket = PollEvented::new(socket)?;
+        let inner = Inner::new_shared(socket, listener_set_readiness);
         let listener = UtpListener {
             inner: inner.clone(),
-            registration: PollEvented::new(listener_registration, handle)?,
+            registration: PollEvented::new(listener_registration)?,
         };
 
         let socket = UtpSocket {
@@ -262,14 +285,15 @@ impl UtpSocket {
         };
 
         let next_tick = Instant::now() + Duration::from_millis(500);
-        let timeout = Timeout::new_at(next_tick, handle)?;
+        let timeout = delay_until(next_tick.into());
         let refresher = SocketRefresher {
             inner,
             next_tick,
             timeout,
             req_finalize: finalize_rx,
         };
-        handle.spawn(refresher);
+
+        tokio::spawn(refresher);
 
         Ok((socket, listener))
     }
@@ -330,10 +354,9 @@ impl UtpSocket {
 
 impl Stream for RawReceiver {
     type Item = RawChannel;
-    type Error = Void;
 
-    fn poll(&mut self) -> Result<Async<Option<RawChannel>>, Void> {
-        self.channel_rx.poll()
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.channel_rx.poll_next_unpin(cx)
     }
 }
 
@@ -352,7 +375,7 @@ impl Drop for RawReceiver {
                 Async::Ready(None) => {
                     break;
                 },
-                Async::NotReady => {
+                Poll::Pending => {
                     // NOTE: we only de-register the channel if the sender is still alive
                     // (indicating it is still registered with the Inner).
                     inner.raw_receiver = None;
@@ -391,7 +414,7 @@ impl Drop for RawChannel {
                 Async::Ready(None) => {
                     break;
                 },
-                Async::NotReady => {
+                Poll::Pending => {
                     // NOTE: we only de-register the channel if the sender is still alive
                     // (indicating it is still registered with the Inner).
                     let _ = inner.raw_channels.remove(&self.peer_addr);
@@ -408,47 +431,54 @@ impl Drop for RawChannel {
 
 impl Stream for RawChannel {
     type Item = BytesMut;
-    type Error = Void;
 
-    fn poll(&mut self) -> Result<Async<Option<BytesMut>>, Void> {
-        let ret = self.bytes_rx.poll();
-        if let Ok(Async::Ready(Some(ref bytes))) = ret {
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let ret = self.bytes_rx.poll_next_unpin(cx);
+        if let Poll::Ready(Some(bytes)) = &ret {
             let mut inner = unwrap!(self.inner.write());
             inner.raw_data_buffered -= bytes.len();
         }
-        ret
+        ret.into()
     }
 }
 
-impl Sink for RawChannel {
-    type SinkItem = Bytes;
-    type SinkError = io::Error;
+impl Sink<Bytes> for RawChannel {
+    type Error = io::Error;
 
-    fn start_send(&mut self, item: Bytes) -> io::Result<AsyncSink<Bytes>> {
-        match self.registration.poll_write() {
-            Async::NotReady => Ok(AsyncSink::NotReady(item)),
-            Async::Ready(()) => {
-                let res = {
-                    let inner = unwrap!(self.inner.read());
-                    inner.shared.send_to(&item[..], &self.peer_addr)
-                };
-                match res {
-                    Ok(n) => {
-                        assert_eq!(n, item.len());
-                        Ok(AsyncSink::Ready)
-                    }
-                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        self.registration.need_write();
-                        Ok(AsyncSink::NotReady(item))
-                    }
-                    Err(e) => Err(e),
+    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.registration.poll_write_ready(cx).map_ok(|_| ())
+    }
+
+    fn start_send(self: Pin<&mut Self>, item: Bytes) -> io::Result<()> {
+        let mut inner = unwrap!(self.inner.write());
+        inner.shared.item = Some(item);
+        Ok(())
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let mut inner = unwrap!(self.inner.write());
+        match &inner.shared.item {
+            Some(item) => match inner.shared.send_to(&item[..], &self.peer_addr) {
+                Ok(n) => {
+                    assert_eq!(n, item.len());
+                    inner.shared.item.take();
+                    Poll::Ready(Ok(()))
                 }
-            }
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    self.registration.clear_write_ready(cx)?;
+                    Poll::Pending
+                }
+                Err(e) => {
+                    inner.shared.item.take();
+                    Poll::Ready(Err(e))
+                }
+            },
+            None => Poll::Ready(Ok(())),
         }
     }
 
-    fn poll_complete(&mut self) -> io::Result<Async<()>> {
-        Ok(Async::Ready(()))
+    fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -475,25 +505,27 @@ impl Evented for UtpSocket {
 impl UtpListener {
     /// Get the local address that the listener is bound to.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        unwrap!(self.inner.read()).shared.socket.local_addr()
+        unwrap!(self.inner.read())
+            .shared
+            .socket
+            .get_ref()
+            .local_addr()
     }
 
     /// Receive a new inbound connection.
     ///
     /// This function will also advance the state of all associated connections.
-    pub fn accept(&self) -> io::Result<UtpStream> {
-        if let Async::NotReady = self.registration.poll_read() {
-            return Err(io::ErrorKind::WouldBlock.into());
-        }
+    pub fn poll_accept(&self, cx: &mut Context<'_>) -> Poll<io::Result<UtpStream>> {
+        ready!(self.registration.poll_read_ready(cx, Ready::readable()))?;
 
-        match unwrap!(self.inner.write()).accept() {
-            Err(e) => {
-                if e.kind() == io::ErrorKind::WouldBlock {
-                    self.registration.need_read();
-                }
-                Err(e)
+        let mut inner = unwrap!(self.inner.write());
+        match inner.poll_accept() {
+            Poll::Ready(s) => Poll::Ready(s),
+            Poll::Pending => {
+                let ready = Ready::readable();
+                self.registration.clear_read_ready(cx, ready)?;
+                Poll::Pending
             }
-            Ok(stream) => Ok(stream),
         }
     }
 
@@ -510,7 +542,7 @@ impl Drop for UtpListener {
 
         // Empty the connection queue
         let mut streams = Vec::new();
-        while let Ok(stream) = inner.accept() {
+        while let Poll::Ready(Ok(stream)) = inner.poll_accept() {
             streams.push(stream);
         }
 
@@ -558,25 +590,26 @@ impl UtpStream {
 
     /// Get the local address that the stream is bound to.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        let inner = unwrap!(self.inner.read());
-        inner.shared.socket.local_addr()
+        unwrap!(self.inner.read())
+            .shared
+            .socket
+            .get_ref()
+            .local_addr()
     }
 
     /// The same as `Read::read` except it does not require a mutable reference to the stream.
-    pub fn read_immutable(&self, dst: &mut [u8]) -> io::Result<usize> {
-        if let Async::NotReady = self.registration.poll_read() {
-            return Err(io::ErrorKind::WouldBlock.into());
-        }
+    fn poll_read_immutable(&self, cx: &mut Context<'_>, dst: &mut [u8]) -> Poll<io::Result<usize>> {
+        ready!(self.registration.poll_read_ready(cx, Ready::readable()))?;
 
         let mut inner = unwrap!(self.inner.write());
         let connection = &mut inner.connections[self.token];
 
         match connection.in_queue.read(dst) {
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                self.registration.need_read();
+                self.registration.clear_read_ready(cx, Ready::readable())?;
                 if connection.state == State::Connected && connection.read_open() {
                     connection.update_readiness()?;
-                    Err(io::ErrorKind::WouldBlock.into())
+                    return Poll::Pending;
                 } else if connection.state == State::Reset {
                     Err(io::ErrorKind::ConnectionReset.into())
                 } else {
@@ -588,42 +621,40 @@ impl UtpStream {
                 ret
             }
         }
+        .into()
     }
 
     /// The same as `Write::write` except it does not require a mutable reference to the stream.
-    pub fn write_immutable(&self, src: &[u8]) -> io::Result<usize> {
-        if let Async::NotReady = self.registration.poll_write() {
-            return Err(io::ErrorKind::WouldBlock.into());
-        }
+    fn poll_write_immutable(&self, cx: &mut Context<'_>, src: &[u8]) -> Poll<io::Result<usize>> {
+        ready!(self.registration.poll_write_ready(cx))?;
 
         match unwrap!(self.inner.write()).write(self.token, src) {
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                self.registration.need_write();
-                Err(io::ErrorKind::WouldBlock.into())
+                self.registration.clear_write_ready(cx)?;
+                Poll::Pending
             }
-            ret => ret,
+            ret => Poll::Ready(ret),
         }
     }
 
     /// Shutdown the write-side of the uTP connection. The stream can still be used to read data
     /// received from the peer but can no longer be used to send data. Will cause the peer to
     /// receive and EOF.
-    pub fn shutdown_write(&self) -> io::Result<()> {
+    fn shutdown_write(&self) -> io::Result<()> {
         unwrap!(self.inner.write()).shutdown_write(self.token)
     }
 
     /// Flush all outgoing data on the socket. Returns `Err(WouldBlock)` if there remains data that
     /// could not be immediately written.
-    pub fn flush_immutable(&self) -> io::Result<()> {
-        if let Async::NotReady = self.registration.poll_write() {
-            return Err(io::ErrorKind::WouldBlock.into());
-        }
+    fn poll_flush_immutable(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        ready!(self.registration.poll_write_ready(cx))?;
 
-        if !unwrap!(self.inner.write()).flush(self.token)? {
-            self.registration.need_write();
-            return Err(io::ErrorKind::WouldBlock.into());
+        if unwrap!(self.inner.write()).flush(self.token)? {
+            Poll::Ready(Ok(()))
+        } else {
+            self.registration.clear_write_ready(cx)?;
+            Poll::Pending
         }
-        Ok(())
     }
 
     /// Sets how long we must lose contact with the remote peer for before we consider the
@@ -711,21 +742,21 @@ pub struct UtpStreamFinalize {
 }
 
 impl Future for UtpStreamFinalize {
-    type Item = ();
-    type Error = Void;
+    type Output = ();
 
-    fn poll(&mut self) -> Result<Async<()>, Void> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         // it can't fail cause `UtpStreamFinalize` holds `UtpStream` which makes sure `Inner`
         // and `Connection` instances are not dropped and `Connection` holds channel transmitter.
-        Ok(unwrap!(self.conn_closed.poll()))
+        let result = ready!(self.conn_closed.poll_unpin(cx));
+        unwrap!(result);
+        Poll::Ready(())
     }
 }
 
 impl Inner {
-    fn new(handle: &Handle, socket: UdpSocket, listener_set_readiness: SetReadiness) -> Inner {
+    fn new(socket: PollEvented<UdpSocket>, listener_set_readiness: SetReadiness) -> Inner {
         Inner {
             shared: Shared::new(socket),
-            remote: handle.remote().clone(),
             connections: Slab::new(),
             connection_lookup: HashMap::new(),
             in_buf: BytesMut::with_capacity(DEFAULT_IN_BUFFER_SIZE),
@@ -741,18 +772,13 @@ impl Inner {
     }
 
     fn new_shared(
-        handle: &Handle,
-        socket: UdpSocket,
+        socket: PollEvented<UdpSocket>,
         listener_set_readiness: SetReadiness,
     ) -> InnerCell {
-        Arc::new(RwLock::new(Inner::new(
-            handle,
-            socket,
-            listener_set_readiness,
-        )))
+        Arc::new(RwLock::new(Inner::new(socket, listener_set_readiness)))
     }
 
-    fn accept(&mut self) -> io::Result<UtpStream> {
+    fn poll_accept(&mut self) -> Poll<io::Result<UtpStream>> {
         match self.accept_buf.pop_front() {
             Some(socket) => {
                 let conn = &mut self.connections[socket.token];
@@ -768,13 +794,12 @@ impl Inner {
 
                 conn.update_readiness()?;
 
-                Ok(socket)
+                Poll::Ready(Ok(socket))
             }
             None => {
                 // Unset readiness
                 self.listener.set_readiness(Ready::empty())?;
-
-                Err(io::ErrorKind::WouldBlock.into())
+                Poll::Pending
             }
         }
     }
@@ -828,12 +853,8 @@ impl Inner {
             send_id += 1;
         }
 
-        let handle = unwrap!(
-            self.remote.handle(),
-            "cannot be used outside of the event loop!"
-        );
         let (registration, set_readiness) = Registration::new2();
-        let registration = PollEvented::new(registration, &handle)?;
+        let registration = PollEvented::new(registration)?;
 
         let mut connection = Connection::new_outgoing(key.clone(), set_readiness, send_id);
         connection.flush(&mut self.shared)?;
@@ -920,18 +941,19 @@ impl Inner {
         Ok(self.connection_lookup.is_empty())
     }
 
-    fn refresh(&mut self, inner: &InnerCell) -> io::Result<Async<bool>> {
+    fn poll_refresh(&mut self, cx: &mut Context<'_>, inner: &InnerCell) -> Poll<io::Result<bool>> {
         let mut ready = Ready::empty();
-        if let Async::Ready(()) = self.shared.socket.poll_read() {
+        if let Poll::Ready(_) = self.shared.socket.poll_read_ready(cx, Ready::readable()) {
             ready |= Ready::readable();
         }
-        if let Async::Ready(()) = self.shared.socket.poll_write() {
+        if let Poll::Ready(_) = self.shared.socket.poll_write_ready(cx) {
             ready |= Ready::writable();
         }
         if ready.is_empty() {
-            Ok(Async::NotReady)
+            Poll::Pending
         } else {
-            Ok(Async::Ready(self.ready(ready, inner)?))
+            let is_ready = self.ready(ready, inner)?;
+            Poll::Ready(Ok(is_ready))
         }
     }
 
@@ -1033,12 +1055,8 @@ impl Inner {
             return Ok(());
         }
 
-        let handle = unwrap!(
-            self.remote.handle(),
-            "cannot be used outside of the event loop!"
-        );
         let (registration, set_readiness) = Registration::new2();
-        let registration = PollEvented::new(registration, &handle)?;
+        let registration = PollEvented::new(registration)?;
 
         let mut connection =
             Connection::new_incoming(key.clone(), set_readiness, send_id, packet.seq_nr());
@@ -1091,12 +1109,8 @@ impl Inner {
         inner: &InnerCell,
         data: Option<BytesMut>,
     ) -> io::Result<RawChannel> {
-        let handle = unwrap!(
-            self.remote.handle(),
-            "cannot be used outside of the event loop!"
-        );
         let (registration, set_readiness) = Registration::new2();
-        let registration = PollEvented::new(registration, &handle)?;
+        let registration = PollEvented::new(registration)?;
         let (tx, rx) = mpsc::unbounded();
         if let Some(data) = data {
             let _ = tx.unbounded_send(data);
@@ -1123,12 +1137,15 @@ impl Inner {
 
         // Read in the bytes
         let addr = unsafe {
-            let (n, addr) = self.shared.recv_from(self.in_buf.bytes_mut())?;
+            let buf = self.in_buf.bytes_mut();
+            buf.iter_mut().for_each(|n| n.as_mut_ptr().write(0));
+            let buf = std::mem::transmute(buf);
+            let (n, addr) = self.shared.recv_from(buf)?;
             self.in_buf.advance_mut(n);
             addr
         };
 
-        let bytes = self.in_buf.take();
+        let bytes = std::mem::replace(&mut self.in_buf, BytesMut::new());
 
         Ok((bytes, addr))
     }
@@ -1164,7 +1181,7 @@ impl Inner {
     }
 
     /// Attempts to send enqueued Reset packets.
-    fn flush_reset_packets(&mut self) -> Result<Async<()>, io::Error> {
+    fn flush_reset_packets(&mut self) -> Poll<io::Result<()>> {
         while let Some((packet, dest_addr)) = self.reset_packets.pop_front() {
             match self.shared.send_to(packet.as_slice(), &dest_addr) {
                 Ok(n) => {
@@ -1174,14 +1191,14 @@ impl Inner {
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                     self.shared.need_writable();
                     let _ = self.reset_packets.push_back((packet, dest_addr));
-                    return Ok(Async::NotReady);
+                    return Poll::Pending;
                 }
                 Err(e) => {
-                    return Err(e);
+                    return Err(e).into();
                 }
             }
         }
-        Ok(Async::Ready(()))
+        Poll::Ready(Ok(()))
     }
 
     fn flush(&mut self, token: usize) -> io::Result<bool> {
@@ -1202,10 +1219,11 @@ impl Inner {
 }
 
 impl Shared {
-    fn new(socket: UdpSocket) -> Self {
+    fn new(socket: PollEvented<UdpSocket>) -> Self {
         Self {
             socket,
             ready: Ready::empty(),
+            item: None,
         }
     }
 
@@ -1223,19 +1241,20 @@ impl Shared {
 
     fn send_to(&self, buf: &[u8], target: &SocketAddr) -> io::Result<usize> {
         if self.connected_peer_addr().is_none() {
-            self.socket.send_to(buf, target)
+            self.socket.get_ref().send_to(buf, target)
         } else {
-            self.socket.send(buf)
+            self.socket.get_ref().send(buf)
         }
     }
 
     fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         if let Some(peer_addr) = self.connected_peer_addr() {
             self.socket
+                .get_ref()
                 .recv(buf)
                 .map(|bytes_received| (bytes_received, peer_addr))
         } else {
-            self.socket.recv_from(buf)
+            self.socket.get_ref().recv_from(buf)
         }
     }
 
@@ -1247,7 +1266,7 @@ impl Shared {
         {
             // NOTE, `peer_addr()` might be implemented for `UdpSocket` in the future.
             // then getpeername() could be removed
-            let res = getpeername(self.socket.as_raw_fd());
+            let res = getpeername(self.socket.get_ref().as_raw_fd());
             match res {
                 Ok(addr) => {
                     if let SockAddr::Inet(addr) = addr {
@@ -1845,20 +1864,21 @@ enum UtpStreamConnectState {
 }
 
 impl Future for UtpStreamConnect {
-    type Item = UtpStream;
-    type Error = io::Error;
+    type Output = io::Result<UtpStream>;
 
-    fn poll(&mut self) -> io::Result<Async<UtpStream>> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let inner = mem::replace(&mut self.state, UtpStreamConnectState::Empty);
         match inner {
-            UtpStreamConnectState::Waiting(stream) => match stream.registration.poll_write() {
-                Async::NotReady => {
-                    mem::replace(&mut self.state, UtpStreamConnectState::Waiting(stream));
-                    Ok(Async::NotReady)
+            UtpStreamConnectState::Waiting(stream) => {
+                match stream.registration.poll_read_ready(cx, Ready::readable()) {
+                    Poll::Pending => {
+                        self.state = UtpStreamConnectState::Waiting(stream);
+                        Poll::Pending
+                    }
+                    Poll::Ready(_) => Ok(stream).into(),
                 }
-                Async::Ready(()) => Ok(Async::Ready(stream)),
-            },
-            UtpStreamConnectState::Err(e) => Err(e),
+            }
+            UtpStreamConnectState::Err(e) => Err(e).into(),
             UtpStreamConnectState::Empty => panic!("can't poll UtpStreamConnect twice!"),
         }
     }
@@ -1867,38 +1887,38 @@ impl Future for UtpStreamConnect {
 struct SocketRefresher {
     inner: InnerCell,
     next_tick: Instant,
-    timeout: Timeout,
+    timeout: Delay,
     req_finalize: oneshot::Receiver<oneshot::Sender<()>>,
 }
 
 impl Future for SocketRefresher {
-    type Item = ();
-    type Error = ();
+    type Output = ();
 
-    fn poll(&mut self) -> Result<Async<()>, ()> {
-        self.poll_inner().map_err(|e| {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        if let Err(e) = ready!(self.poll_inner(cx)) {
             error!("UtpSocket died! {:?}", e);
-        })
+        }
+        Poll::Ready(())
     }
 }
 
 impl SocketRefresher {
-    fn poll_inner(&mut self) -> io::Result<Async<()>> {
-        while let Async::Ready(()) = self.timeout.poll()? {
+    fn poll_inner(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        while let Poll::Ready(()) = self.timeout.poll_unpin(cx) {
             unwrap!(self.inner.write()).tick()?;
             self.next_tick += Duration::from_millis(500);
-            self.timeout.reset(self.next_tick);
+            self.timeout.reset(self.next_tick.into());
         }
 
-        if let Async::Ready(true) = unwrap!(self.inner.write()).refresh(&self.inner)? {
+        if let Poll::Ready(true) = unwrap!(self.inner.write()).poll_refresh(cx, &self.inner)? {
             if 1 == Arc::strong_count(&self.inner) {
-                if let Ok(Async::Ready(resp_finalize)) = self.req_finalize.poll() {
+                if let Poll::Ready(Ok(resp_finalize)) = self.req_finalize.poll_unpin(cx) {
                     let _ = resp_finalize.send(());
                 }
-                return Ok(Async::Ready(()));
+                return Poll::Ready(Ok(()));
             }
         }
-        Ok(Async::NotReady)
+        Poll::Pending
     }
 }
 
@@ -1908,14 +1928,12 @@ pub struct UtpSocketFinalize {
 }
 
 impl Future for UtpSocketFinalize {
-    type Item = ();
-    type Error = Void;
+    type Output = ();
 
-    fn poll(&mut self) -> Result<Async<()>, Void> {
-        if let Async::Ready(()) = unwrap!(self.resp_finalize.poll()) {
-            return Ok(Async::Ready(()));
-        }
-        Ok(Async::NotReady)
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let result = ready!(self.resp_finalize.poll_unpin(cx));
+        unwrap!(result);
+        Poll::Ready(())
     }
 }
 
@@ -1925,726 +1943,724 @@ pub struct Incoming {
 }
 
 impl Stream for Incoming {
-    type Item = UtpStream;
-    type Error = io::Error;
+    type Item = io::Result<UtpStream>;
 
-    fn poll(&mut self) -> io::Result<Async<Option<UtpStream>>> {
-        match self.listener.accept() {
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => Ok(Async::NotReady),
-            Err(e) => Err(e),
-            Ok(s) => Ok(Async::Ready(Some(s))),
-        }
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let s = ready!(self.listener.poll_accept(cx))?;
+        Poll::Ready(Some(Ok(s)))
     }
 }
 
-impl io::Read for UtpStream {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.read_immutable(buf)
+impl AsyncRead for UtpStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        self.poll_read_immutable(cx, buf)
     }
 }
-
-impl io::Write for UtpStream {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.write_immutable(buf)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.flush_immutable()
-    }
-}
-
-impl AsyncRead for UtpStream {}
 
 impl AsyncWrite for UtpStream {
-    fn shutdown(&mut self) -> io::Result<Async<()>> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.poll_write_immutable(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.poll_flush_immutable(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.shutdown_write()?;
-        Ok(Async::Ready(()))
+        Poll::Ready(Ok(()))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use tokio_core::reactor::Core;
-
-    /// Reduces boilerplate and creates connection with some specific parameters.
-    fn test_connection() -> Connection {
-        let key = Key {
-            receive_id: 12_345,
-            addr: addr!("1.2.3.4:5000"),
-        };
-        let (_registration, set_readiness) = Registration::new2();
-        Connection::new_outgoing(key, set_readiness, 12_346)
-    }
-
-    mod inner {
-        use super::*;
-        use futures::future::{self, Loop};
-        use futures::sync::mpsc;
-
-        /// Creates new UDP socket and waits for incoming uTP packets.
-        /// Returns future that yields received packet and listener address.
-        fn wait_for_packets(handle: &Handle) -> (mpsc::UnboundedReceiver<Packet>, SocketAddr) {
-            let (packets_tx, packets_rx) = mpsc::unbounded();
-            let listener = unwrap!(UdpSocket::bind(&addr!("127.0.0.1:0"), handle));
-            let listener_addr = unwrap!(listener.local_addr());
-
-            let recv_response =
-                future::loop_fn((listener, packets_tx), |(listener, packets_tx)| {
-                    listener.recv_dgram(vec![0u8; 256]).map(
-                        move |(listener, buff, bytes_received, _addr)| {
-                            let buff = BytesMut::from(&buff[..bytes_received]);
-                            let packet = unwrap!(Packet::parse(buff));
-                            unwrap!(packets_tx.unbounded_send(packet));
-                            Loop::Continue((listener, packets_tx))
-                        },
-                    )
-                }).map_err(|e| panic!(e))
-                .then(|_res: Result<(), _>| Ok(()));
-            handle.spawn(recv_response);
-
-            (packets_rx, listener_addr)
-        }
-
-        /// Reduce some boilerplate.
-        /// Returns socket inner with some common defaults.
-        fn make_socket_inner(evloop: &Core) -> InnerCell {
-            let handle = evloop.handle();
-            let (_listener_registration, listener_set_readiness) = Registration::new2();
-            let socket = unwrap!(UdpSocket::bind(&addr!("127.0.0.1:0"), &handle));
-            Inner::new_shared(&handle, socket, listener_set_readiness)
-        }
-
-        mod process_unknown {
-            use super::*;
-
-            #[test]
-            fn when_packet_is_syn_it_schedules_reset_back() {
-                let evloop = unwrap!(Core::new());
-                let inner = make_socket_inner(&evloop);
-
-                let mut packet = Packet::syn();
-                packet.set_connection_id(12_345);
-                let peer_addr = addr!("1.2.3.4:5000");
-
-                unwrap!(unwrap!(inner.write()).process_unknown(packet, peer_addr, &inner));
-
-                let packet_opt = unwrap!(inner.write()).reset_packets.pop_front();
-                let (packet, dest_addr) = unwrap!(packet_opt);
-                assert_eq!(packet.connection_id(), 12_345);
-                assert_eq!(packet.ty(), packet::Type::Reset);
-                assert_eq!(dest_addr, addr!("1.2.3.4:5000"));
-            }
-
-            #[test]
-            fn when_packet_is_reset_nothing_is_sent_back() {
-                let evloop = unwrap!(Core::new());
-                let inner = make_socket_inner(&evloop);
-
-                let mut packet = Packet::reset();
-                packet.set_connection_id(12_345);
-                let peer_addr = addr!("1.2.3.4:5000");
-
-                unwrap!(unwrap!(inner.write()).process_unknown(packet, peer_addr, &inner));
-
-                assert!(unwrap!(inner.write()).reset_packets.is_empty());
-            }
-        }
-
-        mod flush_reset_packets {
-            use super::*;
-            use hamcrest::prelude::*;
-
-            #[test]
-            fn it_attempts_to_send_all_queued_reset_packets() {
-                let mut evloop = unwrap!(Core::new());
-                let handle = evloop.handle();
-                let inner = make_socket_inner(&evloop);
-
-                let task = future::lazy(|| {
-                    let (packets_rx, remote_peer_addr) = wait_for_packets(&handle);
-
-                    let mut packet = Packet::reset();
-                    packet.set_connection_id(12_345);
-                    unwrap!(
-                        unwrap!(inner.write())
-                            .reset_packets
-                            .push_back((packet, remote_peer_addr))
-                    );
-                    let mut packet = Packet::reset();
-                    packet.set_connection_id(23_456);
-                    unwrap!(
-                        unwrap!(inner.write())
-                            .reset_packets
-                            .push_back((packet, remote_peer_addr))
-                    );
-
-                    // keep retrying until all packets are sent out
-                    future::poll_fn(move || unwrap!(inner.write()).flush_reset_packets())
-                        .and_then(move |_| packets_rx.take(2).collect().map_err(|e| panic!(e)))
-                });
-                let packets = unwrap!(evloop.run(task));
-
-                let packet_ids: Vec<u16> = packets.iter().map(|p| p.connection_id()).collect();
-                assert_that!(&packet_ids, contains(vec![12_345, 23_456]).exactly());
-            }
-        }
-
-        mod process_syn {
-            use super::*;
-
-            #[test]
-            fn when_listener_is_closed_it_schedules_reset_packet_back() {
-                let evloop = unwrap!(Core::new());
-                let inner = make_socket_inner(&evloop);
-                unwrap!(inner.write()).listener_open = false;
-
-                let mut packet = Packet::syn();
-                packet.set_connection_id(12_345);
-                let peer_addr = addr!("1.2.3.4:5000");
-
-                unwrap!(unwrap!(inner.write()).process_syn(&packet, peer_addr, &inner));
-
-                let packet_opt = unwrap!(inner.write()).reset_packets.pop_front();
-                let (packet, dest_addr) = unwrap!(packet_opt);
-                assert_eq!(packet.connection_id(), 12_345);
-                assert_eq!(packet.ty(), packet::Type::Reset);
-                assert_eq!(dest_addr, addr!("1.2.3.4:5000"));
-            }
-        }
-
-        mod shutdown_write {
-            use super::*;
-
-            #[test]
-            fn it_closes_further_writes() {
-                let evloop = unwrap!(Core::new());
-                let inner = make_socket_inner(&evloop);
-                let mut inner = unwrap!(inner.write());
-
-                let conn = test_connection();
-                assert!(conn.write_open);
-                let conn_token = inner.connections.insert(conn);
-
-                unwrap!(inner.shutdown_write(conn_token));
-
-                let conn = &inner.connections[conn_token];
-                assert!(!conn.write_open);
-            }
-
-            #[test]
-            fn when_fin_was_not_sent_yet_it_enqueues_fin_packet() {
-                let evloop = unwrap!(Core::new());
-                let inner = make_socket_inner(&evloop);
-                let mut inner = unwrap!(inner.write());
-
-                let mut conn = test_connection();
-                if let Some(next) = conn.out_queue.next() {
-                    next.sent()
-                } // skip queued Syn packet
-                let conn_token = inner.connections.insert(conn);
-
-                unwrap!(inner.shutdown_write(conn_token));
-
-                let conn = &mut inner.connections[conn_token];
-                if let Some(next) = conn.out_queue.next() {
-                    assert_eq!(next.packet().ty(), packet::Type::Fin);
-                } else {
-                    panic!("Packet expected in out_queue");
-                }
-            }
-        }
-
-        mod close {
-            use super::*;
-
-            #[test]
-            fn when_fin_packet_was_sent_it_does_not_enqueue_another() {
-                let evloop = unwrap!(Core::new());
-                let inner = make_socket_inner(&evloop);
-                let mut inner = unwrap!(inner.write());
-
-                let mut conn = test_connection();
-                if let Some(next) = conn.out_queue.next() {
-                    next.sent()
-                } // skip queued Syn packet
-                let conn_token = inner.connections.insert(conn);
-                unwrap!(inner.shutdown_write(conn_token));
-
-                inner.close(conn_token);
-
-                let conn = &mut inner.connections[conn_token];
-                // skip first queued Fin packet
-                if let Some(next) = conn.out_queue.next() {
-                    next.sent()
-                }
-                assert!(conn.out_queue.next().is_none());
-            }
-        }
-    }
-
-    mod connection {
-        use super::*;
-
-        mod tick {
-            use super::*;
-
-            #[test]
-            fn when_no_data_is_received_within_timeout_it_schedules_reset() {
-                let evloop = unwrap!(Core::new());
-                let handle = evloop.handle();
-                let key = Key {
-                    receive_id: 12_345,
-                    addr: addr!("1.2.3.4:5000"),
-                };
-                let (_registration, set_readiness) = Registration::new2();
-                let mut conn = Connection::new_outgoing(key, set_readiness, 12_346);
-                // make connection timeout
-                conn.disconnect_timeout_secs = 0;
-                let sock = unwrap!(UdpSocket::bind(&addr!("127.0.0.1:0"), &handle));
-                let mut shared = Shared::new(sock);
-
-                let reset_info = unwrap!(conn.tick(&mut shared));
-
-                assert_eq!(reset_info, Some((12_346, addr!("1.2.3.4:5000"))));
-            }
-        }
-
-        mod sum_delay_diffs {
-            use super::*;
-
-            mod when_avg_delay_base_is_bigger_than_actual_delay {
-                use super::*;
-
-                #[test]
-                fn it_adds_their_negative_difference() {
-                    let mut conn = test_connection();
-                    conn.average_delay_base = 500;
-
-                    conn.sum_delay_diffs(200);
-
-                    assert_eq!(conn.current_delay_sum, -300);
-                }
-            }
-
-            mod when_actual_delay_is_bigger_than_avg_base_delay {
-                use super::*;
-
-                #[test]
-                fn it_adds_their_difference() {
-                    let mut conn = test_connection();
-                    conn.average_delay_base = 200;
-
-                    conn.sum_delay_diffs(500);
-
-                    assert_eq!(conn.current_delay_sum, 300);
-                }
-            }
-        }
-
-        mod recalculate_avg_delay {
-            use super::*;
-
-            #[test]
-            fn it_sets_average_delay_from_current_delay_sum() {
-                let mut conn = test_connection();
-                conn.current_delay_sum = 2500;
-                conn.current_delay_samples = 5;
-
-                conn.recalculate_avg_delay();
-
-                assert_eq!(conn.average_delay, 500);
-            }
-
-            #[test]
-            fn it_clears_current_delay_sum() {
-                let mut conn = test_connection();
-                conn.current_delay_sum = 2500;
-                conn.current_delay_samples = 5;
-
-                conn.recalculate_avg_delay();
-
-                assert_eq!(conn.current_delay_sum, 0);
-                assert_eq!(conn.current_delay_samples, 0);
-            }
-        }
-
-        mod adjust_average_delay {
-            use super::*;
-
-            mod when_prev_and_current_avg_delays_are_positive {
-                use super::*;
-
-                #[test]
-                fn it_adds_smaller_average_delay_to_avg_delay_base() {
-                    let mut conn = test_connection();
-                    conn.average_delay = 4000;
-                    conn.average_delay_base = 1000;
-
-                    let _ = conn.adjust_average_delay(2000);
-
-                    assert_eq!(conn.average_delay_base, 3000);
-                }
-
-                #[test]
-                fn it_adds_smaller_average_delay_to_avg_delay_base_and_wraps_when_overflow() {
-                    let mut conn = test_connection();
-                    conn.average_delay = 4000;
-                    conn.average_delay_base = -1000i32 as u32;
-
-                    let _ = conn.adjust_average_delay(2000);
-
-                    assert_eq!(conn.average_delay_base, 1000);
-                }
-
-                #[test]
-                fn it_subtracts_smaller_average_delay_from_avg_delay() {
-                    let mut conn = test_connection();
-                    conn.average_delay = 4000;
-
-                    let _ = conn.adjust_average_delay(1000);
-
-                    assert_eq!(conn.average_delay, 3000);
-                }
-
-                #[test]
-                fn it_subtracts_smaller_average_delay_from_prev_avg_delay() {
-                    let mut conn = test_connection();
-                    conn.average_delay = 1000;
-
-                    let prev_average_delay = conn.adjust_average_delay(4000);
-
-                    assert_eq!(prev_average_delay, 3000);
-                }
-            }
-
-            mod when_prev_and_current_avg_delays_are_negative {
-                use super::*;
-
-                #[test]
-                fn it_subtracts_bigger_average_delay_from_avg_delay_base() {
-                    let mut conn = test_connection();
-                    conn.average_delay = -4000;
-                    conn.average_delay_base = 5000;
-
-                    let _ = conn.adjust_average_delay(-2000);
-
-                    assert_eq!(conn.average_delay_base, 3000);
-                }
-
-                #[test]
-                fn it_subtracts_bigger_avg_delay_from_avg_delay_base_and_wraps_when_underflow() {
-                    let mut conn = test_connection();
-                    conn.average_delay = -4000;
-                    conn.average_delay_base = 1000;
-
-                    let _ = conn.adjust_average_delay(-2000);
-
-                    assert_eq!(conn.average_delay_base, -1000i32 as u32);
-                }
-
-                #[test]
-                fn it_adds_bigger_average_delay_to_avg_delay() {
-                    let mut conn = test_connection();
-                    conn.average_delay = -4000;
-
-                    let _ = conn.adjust_average_delay(-1000);
-
-                    assert_eq!(conn.average_delay, -3000);
-                }
-
-                #[test]
-                fn it_adds_bigger_average_delay_to_prev_avg_delay() {
-                    let mut conn = test_connection();
-                    conn.average_delay = -1000;
-
-                    let prev_average_delay = conn.adjust_average_delay(-4000);
-
-                    assert_eq!(prev_average_delay, -3000);
-                }
-            }
-        }
-
-        mod read_open {
-            use super::*;
-
-            #[test]
-            fn when_fin_was_not_received_it_returns_true() {
-                let conn = test_connection();
-                assert!(conn.fin_received.is_none());
-
-                assert!(conn.read_open());
-            }
-
-            #[test]
-            fn when_fin_received_it_returns_false() {
-                let mut conn = test_connection();
-                conn.fin_received = Some(123);
-
-                assert!(!conn.read_open());
-            }
-        }
-
-        mod is_readable {
-            use super::*;
-
-            #[test]
-            fn when_reads_are_closed_it_returns_true() {
-                let mut conn = test_connection();
-                conn.fin_received = Some(123);
-
-                assert!(conn.is_readable());
-            }
-
-            #[test]
-            fn when_reads_are_open_but_input_queue_is_emtpy_it_returns_false() {
-                let conn = test_connection();
-                assert!(conn.fin_received.is_none());
-
-                assert!(!conn.is_readable());
-            }
-        }
-
-        mod schedule_fin {
-            use super::*;
-
-            mod when_fin_was_not_sent_yet {
-                use super::*;
-
-                #[test]
-                fn it_enqueues_fin_packet() {
-                    let mut conn = test_connection();
-                    // skip queued Syn packet
-                    if let Some(next) = conn.out_queue.next() {
-                        next.sent()
-                    }
-
-                    let _ = conn.schedule_fin();
-
-                    if let Some(next) = conn.out_queue.next() {
-                        assert_eq!(next.packet().ty(), packet::Type::Fin);
-                    } else {
-                        panic!("Packet expected in out_queue");
-                    }
-                }
-
-                #[test]
-                fn it_notes_that_fin_was_sent() {
-                    let mut conn = test_connection();
-                    assert!(conn.fin_sent.is_none());
-
-                    let _ = conn.schedule_fin();
-
-                    assert!(conn.fin_sent.is_some());
-                }
-
-                #[test]
-                fn it_returns_true() {
-                    let mut conn = test_connection();
-
-                    let fin_queued = conn.schedule_fin();
-
-                    assert!(fin_queued);
-                }
-            }
-
-            #[test]
-            fn when_fin_was_already_queued_it_returns_false() {
-                let mut conn = test_connection();
-                let _ = conn.schedule_fin();
-
-                let fin_queued = conn.schedule_fin();
-
-                assert!(!fin_queued);
-            }
-        }
-
-        mod acks_fin_sent {
-            use super::*;
-
-            #[test]
-            fn when_fin_was_not_sent_yet_it_returns_false() {
-                let conn = test_connection();
-                assert!(conn.fin_sent.is_none());
-
-                let acks = conn.acks_fin_sent(&Packet::state());
-
-                assert!(!acks);
-            }
-
-            mod when_fin_was_sent {
-                use super::*;
-
-                #[test]
-                fn when_ack_packet_is_not_for_our_fin_it_returns_false() {
-                    let mut conn = test_connection();
-                    conn.fin_sent = Some(5);
-                    let mut packet = Packet::state();
-                    packet.set_ack_nr(4);
-
-                    let acks = conn.acks_fin_sent(&packet);
-
-                    assert!(!acks);
-                }
-
-                #[test]
-                fn when_ack_packet_is_or_our_fin_it_returns_true() {
-                    let mut conn = test_connection();
-                    conn.fin_sent = Some(5);
-                    let mut packet = Packet::state();
-                    packet.set_ack_nr(5);
-
-                    let acks = conn.acks_fin_sent(&packet);
-
-                    assert!(acks);
-                }
-            }
-        }
-
-        mod check_acks_fin_sent {
-            use super::*;
-
-            #[test]
-            fn it_notes_that_our_fin_was_acked() {
-                let mut conn = test_connection();
-                conn.fin_sent = Some(5);
-                assert!(!conn.fin_sent_acked);
-
-                let mut packet = Packet::state();
-                packet.set_ack_nr(5);
-                conn.check_acks_fin_sent(&packet);
-
-                assert!(conn.fin_sent_acked);
-            }
-
-            #[test]
-            fn when_fin_was_received_connection_state_is_changed_to_closed() {
-                let mut conn = test_connection();
-                conn.fin_sent = Some(5);
-                conn.fin_received = Some(123);
-                assert!(!conn.fin_sent_acked);
-
-                let mut packet = Packet::state();
-                packet.set_ack_nr(5);
-                conn.check_acks_fin_sent(&packet);
-
-                assert_eq!(conn.state, State::Closed);
-            }
-        }
-
-        mod process_queued {
-            use super::*;
-
-            #[test]
-            fn when_packet_is_fin_it_saves_its_sequence_number() {
-                let mut conn = test_connection();
-                assert!(conn.fin_received.is_none());
-                let mut fin_packet = Packet::fin();
-                fin_packet.set_seq_nr(123);
-
-                conn.process_queued(&fin_packet);
-
-                assert_eq!(conn.fin_received, Some(123));
-            }
-        }
-
-        mod set_closed_tx {
-            use super::*;
-
-            #[test]
-            fn when_connection_is_already_closed_it_notifies_via_given_transmitter() {
-                let mut conn = test_connection();
-                conn.state = State::Closed;
-
-                let (closed_tx, closed_rx) = oneshot::channel();
-                conn.set_closed_tx(closed_tx);
-
-                unwrap!(closed_rx.wait());
-            }
-        }
-    }
-
-    mod state {
-        use super::*;
-
-        #[test]
-        fn is_closed_returns_true_for_states_when_we_shouldnt_send_data_over_connection() {
-            let closing_states = vec![State::FinSent, State::Reset, State::Closed];
-
-            for state in closing_states {
-                assert!(state.is_closed());
-            }
-        }
-
-        #[test]
-        fn is_closed_returns_false_for_states_when_we_can_send_data_over_connection() {
-            let closing_states = vec![State::SynSent, State::SynRecv, State::Connected];
-
-            for state in closing_states {
-                assert!(!state.is_closed());
-            }
-        }
-    }
-
-    mod utp_stream {
-        use super::*;
-
-        mod flush_immutable {
-            use super::*;
-            use future_utils::{FutureExt, Timeout};
-            use futures::future;
-            use tokio_io;
-
-            #[test]
-            fn when_writes_are_blocked_it_reschedules_current_task_polling_in_the_future() {
-                let mut evloop = unwrap!(Core::new());
-                let handle = evloop.handle();
-                let handle2 = handle.clone();
-
-                let (sock, _) = unwrap!(UtpSocket::bind(&addr!("127.0.0.1:0"), &handle));
-                let (_, listener) = unwrap!(UtpSocket::bind(&addr!("127.0.0.1:0"), &handle));
-                let listener_addr = unwrap!(listener.local_addr());
-
-                let accept_connections = listener
-                    .incoming()
-                    .into_future()
-                    .map_err(|(e, _)| panic!(e))
-                    .and_then(move |(stream, _incoming)| {
-                        let stream = unwrap!(stream);
-                        Timeout::new(Duration::from_secs(1), &handle)
-                            .infallible()
-                            .and_then(move |()| {
-                                // send smth to awake remote socket writes
-                                tokio_io::io::write_all(stream, b"some data")
-                                    .map_err(|e| panic!(e))
-                                    .and_then(|(stream, _)| {
-                                        // keeps stream alive
-                                        tokio_io::io::read_to_end(stream, Vec::new())
-                                    })
-                            })
-                    }).then(|_| Ok(()));
-                handle2.spawn(accept_connections);
-                let stream =
-                    unwrap!(evloop.run(future::lazy(move || sock.connect(&listener_addr))));
-
-                let mut flush_called = 0;
-                let flush_tx = future::poll_fn(move || {
-                    if flush_called == 0 {
-                        // blocks first flush
-                        stream.registration.need_write();
-                    }
-                    flush_called += 1;
-
-                    match stream.flush_immutable() {
-                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => Ok(Async::NotReady),
-                        Err(e) => Err(e),
-                        Ok(()) => Ok(Async::Ready(flush_called)),
-                    }
-                });
-                let flush_called = unwrap!(evloop.run(flush_tx));
-
-                assert!(flush_called > 1);
-            }
-        }
-    }
+    //     use super::*;
+    //     use tokio_core::reactor::Core;
+
+    //     /// Reduces boilerplate and creates connection with some specific parameters.
+    //     fn test_connection() -> Connection {
+    //         let key = Key {
+    //             receive_id: 12_345,
+    //             addr: addr!("1.2.3.4:5000"),
+    //         };
+    //         let (_registration, set_readiness) = Registration::new2();
+    //         Connection::new_outgoing(key, set_readiness, 12_346)
+    //     }
+
+    //     mod inner {
+    //         use super::*;
+    //         use futures::future::{self, Loop};
+    //         use futures::sync::mpsc;
+
+    //         /// Creates new UDP socket and waits for incoming uTP packets.
+    //         /// Returns future that yields received packet and listener address.
+    //         fn wait_for_packets(handle: &Handle) -> (mpsc::UnboundedReceiver<Packet>, SocketAddr) {
+    //             let (packets_tx, packets_rx) = mpsc::unbounded();
+    //             let listener = unwrap!(UdpSocket::bind(&addr!("127.0.0.1:0"), handle));
+    //             let listener_addr = unwrap!(listener.local_addr());
+
+    //             let recv_response =
+    //                 future::loop_fn((listener, packets_tx), |(listener, packets_tx)| {
+    //                     listener.recv_dgram(vec![0u8; 256]).map(
+    //                         move |(listener, buff, bytes_received, _addr)| {
+    //                             let buff = BytesMut::from(&buff[..bytes_received]);
+    //                             let packet = unwrap!(Packet::parse(buff));
+    //                             unwrap!(packets_tx.unbounded_send(packet));
+    //                             Loop::Continue((listener, packets_tx))
+    //                         },
+    //                     )
+    //                 })
+    //                 .map_err(|e| panic!(e))
+    //                 .then(|_res: Result<(), _>| Ok(()));
+    //             handle.spawn(recv_response);
+
+    //             (packets_rx, listener_addr)
+    //         }
+
+    //         /// Reduce some boilerplate.
+    //         /// Returns socket inner with some common defaults.
+    //         fn make_socket_inner(evloop: &Core) -> InnerCell {
+    //             let handle = evloop.handle();
+    //             let (_listener_registration, listener_set_readiness) = Registration::new2();
+    //             let socket = unwrap!(UdpSocket::bind(&addr!("127.0.0.1:0"), &handle));
+    //             Inner::new_shared(&handle, socket, listener_set_readiness)
+    //         }
+
+    //         mod process_unknown {
+    //             use super::*;
+
+    //             #[test]
+    //             fn when_packet_is_syn_it_schedules_reset_back() {
+    //                 let evloop = unwrap!(Core::new());
+    //                 let inner = make_socket_inner(&evloop);
+
+    //                 let mut packet = Packet::syn();
+    //                 packet.set_connection_id(12_345);
+    //                 let peer_addr = addr!("1.2.3.4:5000");
+
+    //                 unwrap!(unwrap!(inner.write()).process_unknown(packet, peer_addr, &inner));
+
+    //                 let packet_opt = unwrap!(inner.write()).reset_packets.pop_front();
+    //                 let (packet, dest_addr) = unwrap!(packet_opt);
+    //                 assert_eq!(packet.connection_id(), 12_345);
+    //                 assert_eq!(packet.ty(), packet::Type::Reset);
+    //                 assert_eq!(dest_addr, addr!("1.2.3.4:5000"));
+    //             }
+
+    //             #[test]
+    //             fn when_packet_is_reset_nothing_is_sent_back() {
+    //                 let evloop = unwrap!(Core::new());
+    //                 let inner = make_socket_inner(&evloop);
+
+    //                 let mut packet = Packet::reset();
+    //                 packet.set_connection_id(12_345);
+    //                 let peer_addr = addr!("1.2.3.4:5000");
+
+    //                 unwrap!(unwrap!(inner.write()).process_unknown(packet, peer_addr, &inner));
+
+    //                 assert!(unwrap!(inner.write()).reset_packets.is_empty());
+    //             }
+    //         }
+
+    //         mod flush_reset_packets {
+    //             use super::*;
+    //             use hamcrest::prelude::*;
+
+    //             #[test]
+    //             fn it_attempts_to_send_all_queued_reset_packets() {
+    //                 let mut evloop = unwrap!(Core::new());
+    //                 let handle = evloop.handle();
+    //                 let inner = make_socket_inner(&evloop);
+
+    //                 let task = future::lazy(|| {
+    //                     let (packets_rx, remote_peer_addr) = wait_for_packets(&handle);
+
+    //                     let mut packet = Packet::reset();
+    //                     packet.set_connection_id(12_345);
+    //                     unwrap!(unwrap!(inner.write())
+    //                         .reset_packets
+    //                         .push_back((packet, remote_peer_addr)));
+    //                     let mut packet = Packet::reset();
+    //                     packet.set_connection_id(23_456);
+    //                     unwrap!(unwrap!(inner.write())
+    //                         .reset_packets
+    //                         .push_back((packet, remote_peer_addr)));
+
+    //                     // keep retrying until all packets are sent out
+    //                     future::poll_fn(move || unwrap!(inner.write()).flush_reset_packets())
+    //                         .and_then(move |_| packets_rx.take(2).collect().map_err(|e| panic!(e)))
+    //                 });
+    //                 let packets = unwrap!(evloop.run(task));
+
+    //                 let packet_ids: Vec<u16> = packets.iter().map(|p| p.connection_id()).collect();
+    //                 assert_that!(&packet_ids, contains(vec![12_345, 23_456]).exactly());
+    //             }
+    //         }
+
+    //         mod process_syn {
+    //             use super::*;
+
+    //             #[test]
+    //             fn when_listener_is_closed_it_schedules_reset_packet_back() {
+    //                 let evloop = unwrap!(Core::new());
+    //                 let inner = make_socket_inner(&evloop);
+    //                 unwrap!(inner.write()).listener_open = false;
+
+    //                 let mut packet = Packet::syn();
+    //                 packet.set_connection_id(12_345);
+    //                 let peer_addr = addr!("1.2.3.4:5000");
+
+    //                 unwrap!(unwrap!(inner.write()).process_syn(&packet, peer_addr, &inner));
+
+    //                 let packet_opt = unwrap!(inner.write()).reset_packets.pop_front();
+    //                 let (packet, dest_addr) = unwrap!(packet_opt);
+    //                 assert_eq!(packet.connection_id(), 12_345);
+    //                 assert_eq!(packet.ty(), packet::Type::Reset);
+    //                 assert_eq!(dest_addr, addr!("1.2.3.4:5000"));
+    //             }
+    //         }
+
+    //         mod shutdown_write {
+    //             use super::*;
+
+    //             #[test]
+    //             fn it_closes_further_writes() {
+    //                 let evloop = unwrap!(Core::new());
+    //                 let inner = make_socket_inner(&evloop);
+    //                 let mut inner = unwrap!(inner.write());
+
+    //                 let conn = test_connection();
+    //                 assert!(conn.write_open);
+    //                 let conn_token = inner.connections.insert(conn);
+
+    //                 unwrap!(inner.shutdown_write(conn_token));
+
+    //                 let conn = &inner.connections[conn_token];
+    //                 assert!(!conn.write_open);
+    //             }
+
+    //             #[test]
+    //             fn when_fin_was_not_sent_yet_it_enqueues_fin_packet() {
+    //                 let evloop = unwrap!(Core::new());
+    //                 let inner = make_socket_inner(&evloop);
+    //                 let mut inner = unwrap!(inner.write());
+
+    //                 let mut conn = test_connection();
+    //                 if let Some(next) = conn.out_queue.next() {
+    //                     next.sent()
+    //                 } // skip queued Syn packet
+    //                 let conn_token = inner.connections.insert(conn);
+
+    //                 unwrap!(inner.shutdown_write(conn_token));
+
+    //                 let conn = &mut inner.connections[conn_token];
+    //                 if let Some(next) = conn.out_queue.next() {
+    //                     assert_eq!(next.packet().ty(), packet::Type::Fin);
+    //                 } else {
+    //                     panic!("Packet expected in out_queue");
+    //                 }
+    //             }
+    //         }
+
+    //         mod close {
+    //             use super::*;
+
+    //             #[test]
+    //             fn when_fin_packet_was_sent_it_does_not_enqueue_another() {
+    //                 let evloop = unwrap!(Core::new());
+    //                 let inner = make_socket_inner(&evloop);
+    //                 let mut inner = unwrap!(inner.write());
+
+    //                 let mut conn = test_connection();
+    //                 if let Some(next) = conn.out_queue.next() {
+    //                     next.sent()
+    //                 } // skip queued Syn packet
+    //                 let conn_token = inner.connections.insert(conn);
+    //                 unwrap!(inner.shutdown_write(conn_token));
+
+    //                 inner.close(conn_token);
+
+    //                 let conn = &mut inner.connections[conn_token];
+    //                 // skip first queued Fin packet
+    //                 if let Some(next) = conn.out_queue.next() {
+    //                     next.sent()
+    //                 }
+    //                 assert!(conn.out_queue.next().is_none());
+    //             }
+    //         }
+    //     }
+
+    //     mod connection {
+    //         use super::*;
+
+    //         mod tick {
+    //             use super::*;
+
+    //             #[test]
+    //             fn when_no_data_is_received_within_timeout_it_schedules_reset() {
+    //                 let evloop = unwrap!(Core::new());
+    //                 let handle = evloop.handle();
+    //                 let key = Key {
+    //                     receive_id: 12_345,
+    //                     addr: addr!("1.2.3.4:5000"),
+    //                 };
+    //                 let (_registration, set_readiness) = Registration::new2();
+    //                 let mut conn = Connection::new_outgoing(key, set_readiness, 12_346);
+    //                 // make connection timeout
+    //                 conn.disconnect_timeout_secs = 0;
+    //                 let sock = unwrap!(UdpSocket::bind(&addr!("127.0.0.1:0"), &handle));
+    //                 let mut shared = Shared::new(sock);
+
+    //                 let reset_info = unwrap!(conn.tick(&mut shared));
+
+    //                 assert_eq!(reset_info, Some((12_346, addr!("1.2.3.4:5000"))));
+    //             }
+    //         }
+
+    //         mod sum_delay_diffs {
+    //             use super::*;
+
+    //             mod when_avg_delay_base_is_bigger_than_actual_delay {
+    //                 use super::*;
+
+    //                 #[test]
+    //                 fn it_adds_their_negative_difference() {
+    //                     let mut conn = test_connection();
+    //                     conn.average_delay_base = 500;
+
+    //                     conn.sum_delay_diffs(200);
+
+    //                     assert_eq!(conn.current_delay_sum, -300);
+    //                 }
+    //             }
+
+    //             mod when_actual_delay_is_bigger_than_avg_base_delay {
+    //                 use super::*;
+
+    //                 #[test]
+    //                 fn it_adds_their_difference() {
+    //                     let mut conn = test_connection();
+    //                     conn.average_delay_base = 200;
+
+    //                     conn.sum_delay_diffs(500);
+
+    //                     assert_eq!(conn.current_delay_sum, 300);
+    //                 }
+    //             }
+    //         }
+
+    //         mod recalculate_avg_delay {
+    //             use super::*;
+
+    //             #[test]
+    //             fn it_sets_average_delay_from_current_delay_sum() {
+    //                 let mut conn = test_connection();
+    //                 conn.current_delay_sum = 2500;
+    //                 conn.current_delay_samples = 5;
+
+    //                 conn.recalculate_avg_delay();
+
+    //                 assert_eq!(conn.average_delay, 500);
+    //             }
+
+    //             #[test]
+    //             fn it_clears_current_delay_sum() {
+    //                 let mut conn = test_connection();
+    //                 conn.current_delay_sum = 2500;
+    //                 conn.current_delay_samples = 5;
+
+    //                 conn.recalculate_avg_delay();
+
+    //                 assert_eq!(conn.current_delay_sum, 0);
+    //                 assert_eq!(conn.current_delay_samples, 0);
+    //             }
+    //         }
+
+    //         mod adjust_average_delay {
+    //             use super::*;
+
+    //             mod when_prev_and_current_avg_delays_are_positive {
+    //                 use super::*;
+
+    //                 #[test]
+    //                 fn it_adds_smaller_average_delay_to_avg_delay_base() {
+    //                     let mut conn = test_connection();
+    //                     conn.average_delay = 4000;
+    //                     conn.average_delay_base = 1000;
+
+    //                     let _ = conn.adjust_average_delay(2000);
+
+    //                     assert_eq!(conn.average_delay_base, 3000);
+    //                 }
+
+    //                 #[test]
+    //                 fn it_adds_smaller_average_delay_to_avg_delay_base_and_wraps_when_overflow() {
+    //                     let mut conn = test_connection();
+    //                     conn.average_delay = 4000;
+    //                     conn.average_delay_base = -1000i32 as u32;
+
+    //                     let _ = conn.adjust_average_delay(2000);
+
+    //                     assert_eq!(conn.average_delay_base, 1000);
+    //                 }
+
+    //                 #[test]
+    //                 fn it_subtracts_smaller_average_delay_from_avg_delay() {
+    //                     let mut conn = test_connection();
+    //                     conn.average_delay = 4000;
+
+    //                     let _ = conn.adjust_average_delay(1000);
+
+    //                     assert_eq!(conn.average_delay, 3000);
+    //                 }
+
+    //                 #[test]
+    //                 fn it_subtracts_smaller_average_delay_from_prev_avg_delay() {
+    //                     let mut conn = test_connection();
+    //                     conn.average_delay = 1000;
+
+    //                     let prev_average_delay = conn.adjust_average_delay(4000);
+
+    //                     assert_eq!(prev_average_delay, 3000);
+    //                 }
+    //             }
+
+    //             mod when_prev_and_current_avg_delays_are_negative {
+    //                 use super::*;
+
+    //                 #[test]
+    //                 fn it_subtracts_bigger_average_delay_from_avg_delay_base() {
+    //                     let mut conn = test_connection();
+    //                     conn.average_delay = -4000;
+    //                     conn.average_delay_base = 5000;
+
+    //                     let _ = conn.adjust_average_delay(-2000);
+
+    //                     assert_eq!(conn.average_delay_base, 3000);
+    //                 }
+
+    //                 #[test]
+    //                 fn it_subtracts_bigger_avg_delay_from_avg_delay_base_and_wraps_when_underflow() {
+    //                     let mut conn = test_connection();
+    //                     conn.average_delay = -4000;
+    //                     conn.average_delay_base = 1000;
+
+    //                     let _ = conn.adjust_average_delay(-2000);
+
+    //                     assert_eq!(conn.average_delay_base, -1000i32 as u32);
+    //                 }
+
+    //                 #[test]
+    //                 fn it_adds_bigger_average_delay_to_avg_delay() {
+    //                     let mut conn = test_connection();
+    //                     conn.average_delay = -4000;
+
+    //                     let _ = conn.adjust_average_delay(-1000);
+
+    //                     assert_eq!(conn.average_delay, -3000);
+    //                 }
+
+    //                 #[test]
+    //                 fn it_adds_bigger_average_delay_to_prev_avg_delay() {
+    //                     let mut conn = test_connection();
+    //                     conn.average_delay = -1000;
+
+    //                     let prev_average_delay = conn.adjust_average_delay(-4000);
+
+    //                     assert_eq!(prev_average_delay, -3000);
+    //                 }
+    //             }
+    //         }
+
+    //         mod read_open {
+    //             use super::*;
+
+    //             #[test]
+    //             fn when_fin_was_not_received_it_returns_true() {
+    //                 let conn = test_connection();
+    //                 assert!(conn.fin_received.is_none());
+
+    //                 assert!(conn.read_open());
+    //             }
+
+    //             #[test]
+    //             fn when_fin_received_it_returns_false() {
+    //                 let mut conn = test_connection();
+    //                 conn.fin_received = Some(123);
+
+    //                 assert!(!conn.read_open());
+    //             }
+    //         }
+
+    //         mod is_readable {
+    //             use super::*;
+
+    //             #[test]
+    //             fn when_reads_are_closed_it_returns_true() {
+    //                 let mut conn = test_connection();
+    //                 conn.fin_received = Some(123);
+
+    //                 assert!(conn.is_readable());
+    //             }
+
+    //             #[test]
+    //             fn when_reads_are_open_but_input_queue_is_emtpy_it_returns_false() {
+    //                 let conn = test_connection();
+    //                 assert!(conn.fin_received.is_none());
+
+    //                 assert!(!conn.is_readable());
+    //             }
+    //         }
+
+    //         mod schedule_fin {
+    //             use super::*;
+
+    //             mod when_fin_was_not_sent_yet {
+    //                 use super::*;
+
+    //                 #[test]
+    //                 fn it_enqueues_fin_packet() {
+    //                     let mut conn = test_connection();
+    //                     // skip queued Syn packet
+    //                     if let Some(next) = conn.out_queue.next() {
+    //                         next.sent()
+    //                     }
+
+    //                     let _ = conn.schedule_fin();
+
+    //                     if let Some(next) = conn.out_queue.next() {
+    //                         assert_eq!(next.packet().ty(), packet::Type::Fin);
+    //                     } else {
+    //                         panic!("Packet expected in out_queue");
+    //                     }
+    //                 }
+
+    //                 #[test]
+    //                 fn it_notes_that_fin_was_sent() {
+    //                     let mut conn = test_connection();
+    //                     assert!(conn.fin_sent.is_none());
+
+    //                     let _ = conn.schedule_fin();
+
+    //                     assert!(conn.fin_sent.is_some());
+    //                 }
+
+    //                 #[test]
+    //                 fn it_returns_true() {
+    //                     let mut conn = test_connection();
+
+    //                     let fin_queued = conn.schedule_fin();
+
+    //                     assert!(fin_queued);
+    //                 }
+    //             }
+
+    //             #[test]
+    //             fn when_fin_was_already_queued_it_returns_false() {
+    //                 let mut conn = test_connection();
+    //                 let _ = conn.schedule_fin();
+
+    //                 let fin_queued = conn.schedule_fin();
+
+    //                 assert!(!fin_queued);
+    //             }
+    //         }
+
+    //         mod acks_fin_sent {
+    //             use super::*;
+
+    //             #[test]
+    //             fn when_fin_was_not_sent_yet_it_returns_false() {
+    //                 let conn = test_connection();
+    //                 assert!(conn.fin_sent.is_none());
+
+    //                 let acks = conn.acks_fin_sent(&Packet::state());
+
+    //                 assert!(!acks);
+    //             }
+
+    //             mod when_fin_was_sent {
+    //                 use super::*;
+
+    //                 #[test]
+    //                 fn when_ack_packet_is_not_for_our_fin_it_returns_false() {
+    //                     let mut conn = test_connection();
+    //                     conn.fin_sent = Some(5);
+    //                     let mut packet = Packet::state();
+    //                     packet.set_ack_nr(4);
+
+    //                     let acks = conn.acks_fin_sent(&packet);
+
+    //                     assert!(!acks);
+    //                 }
+
+    //                 #[test]
+    //                 fn when_ack_packet_is_or_our_fin_it_returns_true() {
+    //                     let mut conn = test_connection();
+    //                     conn.fin_sent = Some(5);
+    //                     let mut packet = Packet::state();
+    //                     packet.set_ack_nr(5);
+
+    //                     let acks = conn.acks_fin_sent(&packet);
+
+    //                     assert!(acks);
+    //                 }
+    //             }
+    //         }
+
+    //         mod check_acks_fin_sent {
+    //             use super::*;
+
+    //             #[test]
+    //             fn it_notes_that_our_fin_was_acked() {
+    //                 let mut conn = test_connection();
+    //                 conn.fin_sent = Some(5);
+    //                 assert!(!conn.fin_sent_acked);
+
+    //                 let mut packet = Packet::state();
+    //                 packet.set_ack_nr(5);
+    //                 conn.check_acks_fin_sent(&packet);
+
+    //                 assert!(conn.fin_sent_acked);
+    //             }
+
+    //             #[test]
+    //             fn when_fin_was_received_connection_state_is_changed_to_closed() {
+    //                 let mut conn = test_connection();
+    //                 conn.fin_sent = Some(5);
+    //                 conn.fin_received = Some(123);
+    //                 assert!(!conn.fin_sent_acked);
+
+    //                 let mut packet = Packet::state();
+    //                 packet.set_ack_nr(5);
+    //                 conn.check_acks_fin_sent(&packet);
+
+    //                 assert_eq!(conn.state, State::Closed);
+    //             }
+    //         }
+
+    //         mod process_queued {
+    //             use super::*;
+
+    //             #[test]
+    //             fn when_packet_is_fin_it_saves_its_sequence_number() {
+    //                 let mut conn = test_connection();
+    //                 assert!(conn.fin_received.is_none());
+    //                 let mut fin_packet = Packet::fin();
+    //                 fin_packet.set_seq_nr(123);
+
+    //                 conn.process_queued(&fin_packet);
+
+    //                 assert_eq!(conn.fin_received, Some(123));
+    //             }
+    //         }
+
+    //         mod set_closed_tx {
+    //             use super::*;
+
+    //             #[test]
+    //             fn when_connection_is_already_closed_it_notifies_via_given_transmitter() {
+    //                 let mut conn = test_connection();
+    //                 conn.state = State::Closed;
+
+    //                 let (closed_tx, closed_rx) = oneshot::channel();
+    //                 conn.set_closed_tx(closed_tx);
+
+    //                 unwrap!(closed_rx.wait());
+    //             }
+    //         }
+    //     }
+
+    //     mod state {
+    //         use super::*;
+
+    //         #[test]
+    //         fn is_closed_returns_true_for_states_when_we_shouldnt_send_data_over_connection() {
+    //             let closing_states = vec![State::FinSent, State::Reset, State::Closed];
+
+    //             for state in closing_states {
+    //                 assert!(state.is_closed());
+    //             }
+    //         }
+
+    //         #[test]
+    //         fn is_closed_returns_false_for_states_when_we_can_send_data_over_connection() {
+    //             let closing_states = vec![State::SynSent, State::SynRecv, State::Connected];
+
+    //             for state in closing_states {
+    //                 assert!(!state.is_closed());
+    //             }
+    //         }
+    //     }
+
+    //     mod utp_stream {
+    //         use super::*;
+
+    //         mod flush_immutable {
+    //             use super::*;
+    //             use future_utils::{FutureExt, Timeout};
+    //             use futures::future;
+    //             use tokio_io;
+
+    //             #[test]
+    //             fn when_writes_are_blocked_it_reschedules_current_task_polling_in_the_future() {
+    //                 let mut evloop = unwrap!(Core::new());
+    //                 let handle = evloop.handle();
+    //                 let handle2 = handle.clone();
+
+    //                 let (sock, _) = unwrap!(UtpSocket::bind(&addr!("127.0.0.1:0"), &handle));
+    //                 let (_, listener) = unwrap!(UtpSocket::bind(&addr!("127.0.0.1:0"), &handle));
+    //                 let listener_addr = unwrap!(listener.local_addr());
+
+    //                 let accept_connections = listener
+    //                     .incoming()
+    //                     .into_future()
+    //                     .map_err(|(e, _)| panic!(e))
+    //                     .and_then(move |(stream, _incoming)| {
+    //                         let stream = unwrap!(stream);
+    //                         Timeout::new(Duration::from_secs(1), &handle)
+    //                             .infallible()
+    //                             .and_then(move |()| {
+    //                                 // send smth to awake remote socket writes
+    //                                 tokio_io::io::write_all(stream, b"some data")
+    //                                     .map_err(|e| panic!(e))
+    //                                     .and_then(|(stream, _)| {
+    //                                         // keeps stream alive
+    //                                         tokio_io::io::read_to_end(stream, Vec::new())
+    //                                     })
+    //                             })
+    //                     })
+    //                     .then(|_| Ok(()));
+    //                 handle2.spawn(accept_connections);
+    //                 let stream =
+    //                     unwrap!(evloop.run(future::lazy(move || sock.connect(&listener_addr))));
+
+    //                 let mut flush_called = 0;
+    //                 let flush_tx = future::poll_fn(move || {
+    //                     if flush_called == 0 {
+    //                         // blocks first flush
+    //                         stream.registration.need_write();
+    //                     }
+    //                     flush_called += 1;
+
+    //                     match stream.flush_immutable() {
+    //                         Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => Ok(Poll::Pending),
+    //                         Err(e) => Err(e),
+    //                         Ok(()) => Ok(Async::Ready(flush_called)),
+    //                     }
+    //                 });
+    //                 let flush_called = unwrap!(evloop.run(flush_tx));
+
+    //                 assert!(flush_called > 1);
+    //             }
+    //         }
+    //     }
 }
