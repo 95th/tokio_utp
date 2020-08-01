@@ -10,7 +10,7 @@ use tokio_utp::*;
 
 #[tokio::main]
 async fn main() {
-    unwrap!(env_logger::init());
+    env_logger::init();
 
     let local_addr: SocketAddr = unwrap!("127.0.0.1:0".parse());
     let remote_addr: SocketAddr = unwrap!("127.0.0.1:4561".parse());

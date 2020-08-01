@@ -27,7 +27,7 @@ unwrap = "1.2.1"
 void = "1"
 
 [dev-dependencies]
-env_logger = "0.4.2"
+env_logger = "0.7.1"
 hamcrest = "~0.1.5"
 
 # [features]

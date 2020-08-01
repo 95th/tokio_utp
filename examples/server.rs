@@ -12,7 +12,7 @@ use tokio_utp::*;
 
 #[tokio::main]
 async fn main() {
-    unwrap!(::env_logger::init());
+    env_logger::init();
 
     // Start a simple echo server
 
