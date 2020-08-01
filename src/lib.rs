@@ -3,6 +3,10 @@ extern crate log;
 #[macro_use]
 extern crate unwrap;
 
+#[cfg(test)]
+#[macro_use]
+extern crate hamcrest;
+
 mod delays;
 mod in_queue;
 mod out_queue;
