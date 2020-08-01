@@ -3,6 +3,7 @@ use crate::{
     in_queue::InQueue,
     out_queue::OutQueue,
     packet::{self, Packet},
+    split::{ReadHalf, WriteHalf},
     util, TIMESTAMP_MASK,
 };
 
@@ -27,12 +28,12 @@ use std::{
     fmt,
     future::Future,
     io, mem,
+    mem::MaybeUninit,
     net::SocketAddr,
     pin::Pin,
     sync::{Arc, RwLock},
     task::{Context, Poll},
     time::{Duration, Instant},
-    u32,
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite, PollEvented},
@@ -597,8 +598,16 @@ impl UtpStream {
             .local_addr()
     }
 
+    pub fn split(&mut self) -> (ReadHalf<'_>, WriteHalf<'_>) {
+        crate::split::split(self)
+    }
+
     /// The same as `Read::read` except it does not require a mutable reference to the stream.
-    fn poll_read_immutable(&self, cx: &mut Context<'_>, dst: &mut [u8]) -> Poll<io::Result<usize>> {
+    pub(crate) fn poll_read_immutable(
+        &self,
+        cx: &mut Context<'_>,
+        dst: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
         ready!(self.registration.poll_read_ready(cx, Ready::readable()))?;
 
         let mut inner = unwrap!(self.inner.write());
@@ -625,7 +634,11 @@ impl UtpStream {
     }
 
     /// The same as `Write::write` except it does not require a mutable reference to the stream.
-    fn poll_write_immutable(&self, cx: &mut Context<'_>, src: &[u8]) -> Poll<io::Result<usize>> {
+    pub(crate) fn poll_write_immutable(
+        &self,
+        cx: &mut Context<'_>,
+        src: &[u8],
+    ) -> Poll<io::Result<usize>> {
         ready!(self.registration.poll_write_ready(cx))?;
 
         match unwrap!(self.inner.write()).write(self.token, src) {
@@ -640,13 +653,13 @@ impl UtpStream {
     /// Shutdown the write-side of the uTP connection. The stream can still be used to read data
     /// received from the peer but can no longer be used to send data. Will cause the peer to
     /// receive and EOF.
-    fn shutdown_write(&self) -> io::Result<()> {
+    pub(crate) fn shutdown_write(&self) -> io::Result<()> {
         unwrap!(self.inner.write()).shutdown_write(self.token)
     }
 
     /// Flush all outgoing data on the socket. Returns `Err(WouldBlock)` if there remains data that
     /// could not be immediately written.
-    fn poll_flush_immutable(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    pub(crate) fn poll_flush_immutable(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         ready!(self.registration.poll_write_ready(cx))?;
 
         if unwrap!(self.inner.write()).flush(self.token)? {
@@ -1952,6 +1965,10 @@ impl Stream for Incoming {
 }
 
 impl AsyncRead for UtpStream {
+    unsafe fn prepare_uninitialized_buffer(&self, _: &mut [MaybeUninit<u8>]) -> bool {
+        false
+    }
+
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -1983,12 +2000,6 @@ impl AsyncWrite for UtpStream {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    macro_rules! addr {
-        ($a:expr) => {
-            $a.parse::<SocketAddr>().unwrap()
-        };
-    }
 
     /// Reduces boilerplate and creates connection with some specific parameters.
     fn test_connection() -> Connection {
@@ -2606,6 +2617,7 @@ mod tests {
 
             #[tokio::test]
             async fn when_writes_are_blocked_it_reschedules_current_task_polling_in_the_future() {
+                env_logger::init();
                 let (sock, _) = unwrap!(UtpSocket::bind(&addr!("127.0.0.1:0")));
                 let (_, listener) = unwrap!(UtpSocket::bind(&addr!("127.0.0.1:0")));
                 let listener_addr = unwrap!(listener.local_addr());
@@ -2618,7 +2630,7 @@ mod tests {
                             unwrap!(stream.write_all(b"some data").await);
                             unwrap!(stream.read_to_end(&mut vec![]).await);
                         };
-                        let result = tokio::time::timeout(Duration::from_secs(1), f).await;
+                        let result = tokio::time::timeout(Duration::from_secs(100), f).await;
                         unwrap!(result)
                     }
                 });

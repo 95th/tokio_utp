@@ -1,3 +1,10 @@
+#[cfg(test)]
+macro_rules! addr {
+    ($a:expr) => {
+        $a.parse::<::std::net::SocketAddr>().unwrap()
+    };
+}
+
 #[macro_use]
 extern crate log;
 #[macro_use]
@@ -12,6 +19,7 @@ mod in_queue;
 mod out_queue;
 mod packet;
 mod socket;
+mod split;
 mod util;
 
 #[cfg(test)]

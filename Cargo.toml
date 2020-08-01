@@ -19,7 +19,7 @@ net-literals = "0.1.2"
 # TODO(povilas): need to update libc in netsim so that we could use latest
 # version V
 nix = "0.18.0"
-rand = "0.7.3"
+rand = { version = "0.7.3", features = ["small_rng"] }
 slab = "0.4.2"
 smallvec = "1.4.1"
 tokio = { version = "0.2.22", features = ["full"] }

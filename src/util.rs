@@ -49,12 +49,47 @@ pub fn generate_sequential_identifiers() -> (u16, u16) {
     }
 }
 
+#[cfg(test)]
+pub fn random_vec(num_bytes: usize) -> Vec<u8> {
+    use rand::RngCore;
+
+    let mut ret = Vec::with_capacity(num_bytes);
+    unsafe { ret.set_len(num_bytes) };
+    THREAD_RNG.with(|r| r.borrow_mut().fill_bytes(&mut ret[..]));
+    ret
+}
+
+#[cfg(not(test))]
 pub fn rand<T>() -> T
 where
     Standard: Distribution<T>,
 {
     let mut rng = rand::thread_rng();
     rng.gen::<T>()
+}
+
+#[cfg(test)]
+pub use self::test::{rand, reset_rand, THREAD_RNG};
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use rand::{rngs::SmallRng, SeedableRng};
+    use std::cell::RefCell;
+
+    thread_local!(pub static THREAD_RNG: RefCell<SmallRng> = RefCell::new(SmallRng::from_entropy()));
+
+    pub fn rand<T>() -> T
+    where
+        Standard: Distribution<T>,
+    {
+        THREAD_RNG.with(|t| t.borrow_mut().gen::<T>())
+    }
+
+    #[cfg(test)]
+    pub fn reset_rand() {
+        THREAD_RNG.with(|t| *t.borrow_mut() = SmallRng::from_entropy());
+    }
 }
 
 #[cfg(test)]
