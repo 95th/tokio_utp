@@ -519,8 +519,7 @@ impl UtpListener {
     pub fn poll_accept(&self, cx: &mut Context<'_>) -> Poll<io::Result<UtpStream>> {
         ready!(self.registration.poll_read_ready(cx, Ready::readable()))?;
 
-        let mut inner = unwrap!(self.inner.write());
-        match inner.poll_accept() {
+        match unwrap!(self.inner.write()).poll_accept() {
             Poll::Ready(s) => Poll::Ready(s),
             Poll::Pending => {
                 let ready = Ready::readable();
@@ -1151,15 +1150,13 @@ impl Inner {
         // Read in the bytes
         let addr = unsafe {
             let buf = self.in_buf.bytes_mut();
-            buf.iter_mut().for_each(|n| n.as_mut_ptr().write(0));
             let buf = std::mem::transmute(buf);
             let (n, addr) = self.shared.recv_from(buf)?;
             self.in_buf.advance_mut(n);
             addr
         };
 
-        let bytes = std::mem::replace(&mut self.in_buf, BytesMut::new());
-
+        let bytes = self.in_buf.split();
         Ok((bytes, addr))
     }
 
@@ -1883,7 +1880,7 @@ impl Future for UtpStreamConnect {
         let inner = mem::replace(&mut self.state, UtpStreamConnectState::Empty);
         match inner {
             UtpStreamConnectState::Waiting(stream) => {
-                match stream.registration.poll_read_ready(cx, Ready::readable()) {
+                match stream.registration.poll_write_ready(cx) {
                     Poll::Pending => {
                         self.state = UtpStreamConnectState::Waiting(stream);
                         Poll::Pending
