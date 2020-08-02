@@ -16,7 +16,8 @@ use std::{
     collections::{HashMap, VecDeque},
     fmt,
     future::Future,
-    io, mem,
+    io::{Error, ErrorKind, Result},
+    mem,
     mem::MaybeUninit,
     net::SocketAddr,
     pin::Pin,
@@ -217,18 +218,18 @@ const MAX_DATA_SIZE: usize = 1_400 - 20;
 
 impl UtpSocket {
     /// Bind a new `UtpSocket` to the given socket address
-    pub async fn bind(addr: &SocketAddr) -> io::Result<(UtpSocket, UtpListener)> {
+    pub async fn bind(addr: &SocketAddr) -> Result<(UtpSocket, UtpListener)> {
         let socket = UdpSocket::bind(addr).await?;
         UtpSocket::from_socket(socket)
     }
 
     /// Gets the local address that the socket is bound to.
-    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+    pub fn local_addr(&self) -> Result<SocketAddr> {
         unwrap!(self.inner.read()).shared.socket.local_addr()
     }
 
     /// Create a new `Utpsocket` backed by the provided `UdpSocket`.
-    pub fn from_socket(socket: UdpSocket) -> io::Result<(UtpSocket, UtpListener)> {
+    pub fn from_socket(socket: UdpSocket) -> Result<(UtpSocket, UtpListener)> {
         let (finalize_tx, finalize_rx) = oneshot::channel();
 
         let inner = Inner::new_shared(socket);
@@ -278,14 +279,14 @@ impl UtpSocket {
 
 impl UtpListener {
     /// Get the local address that the listener is bound to.
-    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+    pub fn local_addr(&self) -> Result<SocketAddr> {
         unwrap!(self.inner.read()).shared.socket.local_addr()
     }
 
     /// Receive a new inbound connection.
     ///
     /// This function will also advance the state of all associated connections.
-    pub fn poll_accept(&self, cx: &mut Context<'_>) -> Poll<io::Result<UtpStream>> {
+    pub fn poll_accept(&self, cx: &mut Context<'_>) -> Poll<Result<UtpStream>> {
         let mut inner = unwrap!(self.inner.write());
         inner.poll_accept(cx)
     }
@@ -334,7 +335,7 @@ impl UtpStream {
     }
 
     /// Get the local address that the stream is bound to.
-    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+    pub fn local_addr(&self) -> Result<SocketAddr> {
         unwrap!(self.inner.read()).shared.socket.local_addr()
     }
 
@@ -347,7 +348,7 @@ impl UtpStream {
         &self,
         cx: &mut Context<'_>,
         dst: &mut [u8],
-    ) -> Poll<io::Result<usize>> {
+    ) -> Poll<Result<usize>> {
         let mut inner = unwrap!(self.inner.write());
         let conn = &mut inner.connections[self.token];
 
@@ -361,7 +362,7 @@ impl UtpStream {
         &self,
         cx: &mut Context<'_>,
         src: &[u8],
-    ) -> Poll<io::Result<usize>> {
+    ) -> Poll<Result<usize>> {
         let mut inner = unwrap!(self.inner.write());
         inner.poll_write(cx, self.token, src)
     }
@@ -369,14 +370,14 @@ impl UtpStream {
     /// Shutdown the write-side of the uTP connection. The stream can still be used to read data
     /// received from the peer but can no longer be used to send data. Will cause the peer to
     /// receive and EOF.
-    pub(crate) fn poll_shutdown_write(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    pub(crate) fn poll_shutdown_write(&self, cx: &mut Context<'_>) -> Poll<Result<()>> {
         let mut inner = unwrap!(self.inner.write());
         inner.poll_shutdown_write(cx, self.token)
     }
 
     /// Flush all outgoing data on the socket. Returns `Poll::Pending` if there remains data that
     /// could not be immediately written.
-    pub(crate) fn poll_flush_immutable(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    pub(crate) fn poll_flush_immutable(&self, cx: &mut Context<'_>) -> Poll<Result<()>> {
         let mut inner = unwrap!(self.inner.write());
         inner.poll_flush(cx, self.token)
     }
@@ -476,7 +477,7 @@ impl Inner {
         Arc::new(RwLock::new(Inner::new(socket)))
     }
 
-    fn poll_accept(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<UtpStream>> {
+    fn poll_accept(&mut self, cx: &mut Context<'_>) -> Poll<Result<UtpStream>> {
         match self.accept_buf.pop_front() {
             Some(socket) => {
                 let conn = &mut self.connections[socket.token];
@@ -505,11 +506,11 @@ impl Inner {
         cx: &mut Context<'_>,
         token: usize,
         src: &[u8],
-    ) -> Poll<io::Result<usize>> {
+    ) -> Poll<Result<usize>> {
         let conn = &mut self.connections[token];
 
         if conn.state.is_closed() || !conn.write_open {
-            return Err(io::ErrorKind::BrokenPipe.into()).into();
+            return Err(ErrorKind::BrokenPipe.into()).into();
         }
 
         match conn.out_queue.poll_write(src) {
@@ -527,14 +528,10 @@ impl Inner {
     }
 
     /// Connect a new `UtpSocket` to the given remote socket address
-    fn connect(&mut self, addr: &SocketAddr, inner: &InnerCell) -> io::Result<UtpStream> {
+    fn connect(&mut self, addr: &SocketAddr, inner: &InnerCell) -> Result<UtpStream> {
         if self.connections.len() >= MAX_CONNECTIONS_PER_SOCKET {
             debug_assert!(self.connections.len() <= MAX_CONNECTIONS_PER_SOCKET);
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                "socket has max connections",
-            ))
-            .into();
+            return Err(Error::new(ErrorKind::Other, "socket has max connections"));
         }
 
         // The peer establishing the connection picks the identifiers uses for
@@ -564,10 +561,9 @@ impl Inner {
             inner: inner.clone(),
             token,
         })
-        .into()
     }
 
-    fn poll_shutdown_write(&mut self, cx: &mut Context<'_>, token: usize) -> Poll<io::Result<()>> {
+    fn poll_shutdown_write(&mut self, cx: &mut Context<'_>, token: usize) -> Poll<Result<()>> {
         let conn = &mut self.connections[token];
         conn.write_open = false;
         if conn.schedule_fin() {
@@ -593,7 +589,7 @@ impl Inner {
         }
     }
 
-    fn poll_ready(&mut self, cx: &mut Context<'_>, inner: &InnerCell) -> Poll<io::Result<bool>> {
+    fn poll_ready(&mut self, cx: &mut Context<'_>, inner: &InnerCell) -> Poll<Result<bool>> {
         // trace!("ready; ready={:?}", ready);
 
         // Update readiness
@@ -603,7 +599,7 @@ impl Inner {
             // Try to receive a packet
             let (bytes, addr) = match self.poll_recv_from(cx) {
                 Poll::Ready(Ok(v)) => v,
-                Poll::Ready(Err(ref e)) if e.kind() == io::ErrorKind::ConnectionReset => {
+                Poll::Ready(Err(ref e)) if e.kind() == ErrorKind::ConnectionReset => {
                     continue;
                 }
                 Poll::Ready(Err(e)) => {
@@ -632,11 +628,11 @@ impl Inner {
         Ok(self.connection_lookup.is_empty()).into()
     }
 
-    fn poll_refresh(&mut self, cx: &mut Context<'_>, inner: &InnerCell) -> Poll<io::Result<bool>> {
+    fn poll_refresh(&mut self, cx: &mut Context<'_>, inner: &InnerCell) -> Poll<Result<bool>> {
         self.poll_ready(cx, inner)
     }
 
-    fn tick(&mut self, cx: &mut Context<'_>) -> io::Result<()> {
+    fn tick(&mut self, cx: &mut Context<'_>) -> Result<()> {
         trace!("Socket::tick");
         let mut reset_packets = Vec::new();
 
@@ -663,7 +659,7 @@ impl Inner {
         bytes: BytesMut,
         addr: SocketAddr,
         inner: &InnerCell,
-    ) -> Poll<io::Result<()>> {
+    ) -> Poll<Result<()>> {
         let packet = match Packet::parse(bytes) {
             Ok(packet) => packet,
             Err(_) => return Ok(()).into(),
@@ -700,7 +696,7 @@ impl Inner {
     }
 
     /// Handle packets with unknown ID.
-    fn process_unknown(&mut self, packet: Packet, addr: SocketAddr) -> io::Result<()> {
+    fn process_unknown(&mut self, packet: Packet, addr: SocketAddr) -> Result<()> {
         trace!("no connection associated with ID; treating as raw data");
 
         if packet.ty() != packet::Type::Reset {
@@ -716,7 +712,7 @@ impl Inner {
         packet: &Packet,
         addr: SocketAddr,
         inner: &InnerCell,
-    ) -> Poll<io::Result<()>> {
+    ) -> Poll<Result<()>> {
         let send_id = packet.connection_id();
         let receive_id = send_id + 1;
         let key = Key { receive_id, addr };
@@ -760,7 +756,7 @@ impl Inner {
         Ok(()).into()
     }
 
-    fn poll_recv_from(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<(BytesMut, SocketAddr)>> {
+    fn poll_recv_from(&mut self, cx: &mut Context<'_>) -> Poll<Result<(BytesMut, SocketAddr)>> {
         // Ensure the buffer has at least 4kb of available space.
         self.in_buf.reserve(MIN_BUFFER_SIZE);
 
@@ -777,7 +773,7 @@ impl Inner {
         Ok((bytes, addr)).into()
     }
 
-    fn poll_flush_all(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_flush_all(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
         if self.connection_lookup.is_empty() {
             return Ok(()).into();
         }
@@ -805,7 +801,7 @@ impl Inner {
     }
 
     /// Attempts to send enqueued Reset packets.
-    fn flush_reset_packets(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn flush_reset_packets(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
         while let Some((packet, dest_addr)) = self.reset_packets.pop_front() {
             match self.shared.poll_send_to(cx, packet.as_slice(), &dest_addr) {
                 Poll::Ready(Ok(n)) => {
@@ -823,7 +819,7 @@ impl Inner {
         Ok(()).into()
     }
 
-    fn poll_flush(&mut self, cx: &mut Context<'_>, token: usize) -> Poll<io::Result<()>> {
+    fn poll_flush(&mut self, cx: &mut Context<'_>, token: usize) -> Poll<Result<()>> {
         let connection = &mut self.connections[token];
         connection.poll_flush(cx, &mut self.shared)
     }
@@ -867,7 +863,7 @@ impl Shared {
         cx: &mut Context<'_>,
         buf: &[u8],
         target: &SocketAddr,
-    ) -> Poll<io::Result<usize>> {
+    ) -> Poll<Result<usize>> {
         if self.connected_peer_addr().is_none() {
             self.socket.poll_send_to(cx, buf, target)
         } else {
@@ -879,7 +875,7 @@ impl Shared {
         &self,
         cx: &mut Context<'_>,
         buf: &mut [u8],
-    ) -> Poll<io::Result<(usize, SocketAddr)>> {
+    ) -> Poll<Result<(usize, SocketAddr)>> {
         if let Some(peer_addr) = self.connected_peer_addr() {
             self.socket
                 .poll_recv(cx, buf)
@@ -1011,7 +1007,7 @@ impl Connection {
         cx: &mut Context<'_>,
         packet: Packet,
         shared: &mut Shared,
-    ) -> Poll<io::Result<bool>> {
+    ) -> Poll<Result<bool>> {
         if self.state == State::Reset {
             return Ok(self.is_finalized()).into();
         }
@@ -1118,7 +1114,7 @@ impl Connection {
     }
 
     /// Returns true, if socket is still ready to write.
-    fn poll_flush(&mut self, cx: &mut Context<'_>, shared: &mut Shared) -> Poll<io::Result<()>> {
+    fn poll_flush(&mut self, cx: &mut Context<'_>, shared: &mut Shared) -> Poll<Result<()>> {
         let mut sent = false;
 
         if self.state == State::Reset {
@@ -1209,7 +1205,7 @@ impl Connection {
         &mut self,
         cx: &mut Context<'_>,
         shared: &mut Shared,
-    ) -> Poll<io::Result<Option<(u16, SocketAddr)>>> {
+    ) -> Poll<Result<Option<(u16, SocketAddr)>>> {
         if self.state == State::Reset {
             return Ok(None).into();
         }
@@ -1482,13 +1478,13 @@ pub struct UtpStreamConnect {
 }
 
 enum UtpStreamConnectState {
-    Err(io::Error),
+    Err(Error),
     Empty,
     Waiting(UtpStream),
 }
 
 impl Future for UtpStreamConnect {
-    type Output = io::Result<UtpStream>;
+    type Output = Result<UtpStream>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let inner = mem::replace(&mut self.state, UtpStreamConnectState::Empty);
@@ -1534,7 +1530,7 @@ impl Future for SocketRefresher {
 }
 
 impl SocketRefresher {
-    fn poll_inner(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_inner(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
         while let Poll::Ready(()) = self.timeout.poll_unpin(cx) {
             unwrap!(self.inner.write()).tick(cx)?;
             self.next_tick += Duration::from_millis(500);
@@ -1574,7 +1570,7 @@ pub struct Incoming {
 }
 
 impl Stream for Incoming {
-    type Item = io::Result<UtpStream>;
+    type Item = Result<UtpStream>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let s = ready!(self.listener.poll_accept(cx))?;
@@ -1591,25 +1587,21 @@ impl AsyncRead for UtpStream {
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut [u8],
-    ) -> Poll<io::Result<usize>> {
+    ) -> Poll<Result<usize>> {
         self.poll_read_immutable(cx, buf)
     }
 }
 
 impl AsyncWrite for UtpStream {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize>> {
         self.poll_write_immutable(cx, buf)
     }
 
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
         self.poll_flush_immutable(cx)
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
         self.poll_shutdown_write(cx)
     }
 }
@@ -2230,7 +2222,7 @@ mod tests {
         mod flush_immutable {
             use super::*;
             use futures::future;
-            use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
             #[tokio::test]
             async fn when_writes_are_blocked_it_reschedules_current_task_polling_in_the_future() {
@@ -2265,7 +2257,7 @@ mod tests {
                     flush_called += 1;
 
                     ready!(stream.poll_flush_immutable(cx))?;
-                    Ok::<_, io::Error>(flush_called).into()
+                    Ok::<_, Error>(flush_called).into()
                 });
                 let flush_called = unwrap!(flush_tx.await);
                 assert!(flush_called > 1);
