@@ -354,7 +354,21 @@ impl UtpStream {
         let mut inner = unwrap!(self.inner.write());
         let conn = &mut inner.connections[self.token];
 
-        let ret = ready!(conn.in_queue.poll_read(cx, dst));
+        let ret = match conn.in_queue.poll_read(cx, dst) {
+            Poll::Ready(ret) => ret,
+            Poll::Pending => {
+                if conn.state == State::Connected && conn.read_open() {
+                    conn.waker = Some(cx.waker().clone());
+                    conn.update_readiness();
+                    return Poll::Pending;
+                } else if conn.state == State::Reset {
+                    Err(ErrorKind::ConnectionReset.into())
+                } else {
+                    Ok(0)
+                }
+            }
+        };
+
         conn.update_local_window();
         ret.into()
     }
