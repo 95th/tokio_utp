@@ -607,7 +607,7 @@ impl Inner {
                     return Err(e).into();
                 }
                 Poll::Pending => {
-                    trace!("ready -> pending");
+                    trace!("poll_ready -> pending");
                     break;
                 }
             };

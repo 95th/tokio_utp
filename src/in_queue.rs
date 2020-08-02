@@ -5,11 +5,7 @@ use bytes::{Buf, BytesMut};
 
 use std::collections::VecDeque;
 use std::io::{self, Cursor, Read};
-use std::{
-    mem,
-    task::{Context, Poll, Waker},
-    u16,
-};
+use std::task::{Context, Poll, Waker};
 
 #[derive(Debug)]
 pub struct InQueue {
@@ -70,9 +66,8 @@ impl InQueue {
 
             // Take the next packet
             let slot = pos % MAX_DELTA_SEQ;
-            let p = mem::replace(&mut self.packets[slot], None);
 
-            let p = match p {
+            let p = match self.packets[slot].take() {
                 Some(p) => {
                     trace!("slot has packet; slot={:?}; packet={:?}", slot, p);
                     p
