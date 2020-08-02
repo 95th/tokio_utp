@@ -43,9 +43,8 @@ impl AsyncWrite for WriteHalf<'_> {
         self.0.poll_flush_immutable(cx)
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.0.shutdown_write()?;
-        Poll::Ready(Ok(()))
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.0.poll_shutdown_write(cx)
     }
 }
 

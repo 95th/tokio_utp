@@ -854,7 +854,6 @@ dependencies = [
  "futures",
  "hamcrest",
  "log",
- "mio",
  "net-literals",
  "nix",
  "rand 0.7.3",

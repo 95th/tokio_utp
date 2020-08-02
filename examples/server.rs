@@ -16,7 +16,7 @@ async fn main() {
     // Start a simple echo server
     let addr: SocketAddr = unwrap!("127.0.0.1:4561".parse());
 
-    let (_, listener) = unwrap!(UtpSocket::bind(&addr));
+    let (_, listener) = unwrap!(UtpSocket::bind(&addr).await);
     debug!("Listener started");
 
     let mut incoming = listener.incoming();

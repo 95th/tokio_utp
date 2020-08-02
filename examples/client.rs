@@ -15,7 +15,7 @@ async fn main() {
     let local_addr: SocketAddr = unwrap!("127.0.0.1:0".parse());
     let remote_addr: SocketAddr = unwrap!("127.0.0.1:4561".parse());
 
-    let (socket, _) = unwrap!(UtpSocket::bind(&local_addr));
+    let (socket, _) = unwrap!(UtpSocket::bind(&local_addr).await);
 
     debug!("Connecting to the server");
     let mut stream = unwrap!(socket.connect(&remote_addr).await);

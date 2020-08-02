@@ -51,8 +51,8 @@ async fn send_data_round_trip(num_bytes: usize) {
     let random_send = util::random_vec(num_bytes);
     let addr = addr!("127.0.0.1:0");
 
-    let (socket_a, _) = unwrap!(UtpSocket::bind(&addr));
-    let (_, listener_b) = unwrap!(UtpSocket::bind(&addr));
+    let (socket_a, _) = unwrap!(UtpSocket::bind(&addr).await);
+    let (_, listener_b) = unwrap!(UtpSocket::bind(&addr).await);
 
     let addr = &unwrap!(listener_b.local_addr());
 
@@ -101,8 +101,8 @@ async fn send_data_one_way(num_bytes: usize) {
     let random_send = util::random_vec(num_bytes);
     let addr = addr!("127.0.0.1:0");
 
-    let (socket_a, _) = unwrap!(UtpSocket::bind(&addr,));
-    let (_, listener_b) = unwrap!(UtpSocket::bind(&addr,));
+    let (socket_a, _) = unwrap!(UtpSocket::bind(&addr).await);
+    let (_, listener_b) = unwrap!(UtpSocket::bind(&addr).await);
 
     let addr = &unwrap!(listener_b.local_addr());
     let task0 = async move {

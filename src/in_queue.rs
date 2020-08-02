@@ -5,7 +5,11 @@ use bytes::{Buf, BytesMut};
 
 use std::collections::VecDeque;
 use std::io::{self, Cursor, Read};
-use std::{mem, u16};
+use std::{
+    mem,
+    task::{Context, Poll, Waker},
+    u16,
+};
 
 #[derive(Debug)]
 pub struct InQueue {
@@ -18,6 +22,9 @@ pub struct InQueue {
 
     // Ignore all packets lower than this seq_nr
     ack_nr: Option<u16>,
+
+    // Waker to wake up read tasks
+    waker: Option<Waker>,
 }
 
 impl InQueue {
@@ -31,6 +38,7 @@ impl InQueue {
             packets: Default::default(),
             data: VecDeque::new(),
             ack_nr,
+            waker: None,
         }
     }
 
@@ -133,28 +141,29 @@ impl InQueue {
             slot
         );
         self.packets[slot] = Some(packet);
+        if let Some(waker) = self.waker.take() {
+            waker.wake();
+        }
         true
     }
 
-    pub fn read(&mut self, dst: &mut [u8]) -> io::Result<usize> {
+    pub fn poll_read(&mut self, cx: &mut Context<'_>, dst: &mut [u8]) -> Poll<io::Result<usize>> {
         let n = match self.data.front_mut() {
             Some(buf) => {
                 let n = buf.read(dst)?;
-
                 if buf.has_remaining() {
-                    return Ok(n);
+                    return Ok(n).into();
                 }
-
                 n
             }
             None => {
-                return Err(io::ErrorKind::WouldBlock.into());
+                self.waker = Some(cx.waker().clone());
+                return Poll::Pending;
             }
         };
 
         let _ = self.data.pop_front();
-
-        Ok(n)
+        Ok(n).into()
     }
 
     /// Returns true, if there's data buffered.
@@ -266,6 +275,7 @@ mod tests {
 
         mod poll {
             use super::*;
+            use futures::future::poll_fn;
 
             #[test]
             fn when_ack_number_is_none_it_returns_none() {
@@ -276,8 +286,8 @@ mod tests {
                 assert!(packet.is_none());
             }
 
-            #[test]
-            fn when_oldest_packet_is_data_it_is_put_to_data_buffer() {
+            #[tokio::test]
+            async fn when_oldest_packet_is_data_it_is_put_to_data_buffer() {
                 let mut in_queue = InQueue::new(Some(0));
                 let mut packet = Packet::data(&[1, 2, 3, 4]);
                 packet.set_seq_nr(1);
@@ -286,7 +296,7 @@ mod tests {
                 let _ = in_queue.poll();
 
                 let mut buffered_data = [0; 4];
-                let _ = unwrap!(in_queue.read(&mut buffered_data));
+                let _ = unwrap!(poll_fn(|cx| in_queue.poll_read(cx, &mut buffered_data)).await);
 
                 assert_eq!(buffered_data, [1, 2, 3, 4]);
             }

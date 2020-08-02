@@ -1,11 +1,16 @@
 //! Queue of outgoing packets.
 
-use crate::packet::{self, Packet};
-use crate::{util, MAX_WINDOW_SIZE};
+use crate::{
+    packet::{self, Packet},
+    util, MAX_WINDOW_SIZE,
+};
 
-use std::collections::VecDeque;
-use std::time::{Duration, Instant};
-use std::{cmp, io};
+use std::{
+    cmp,
+    collections::VecDeque,
+    task::Poll,
+    time::{Duration, Instant},
+};
 
 // TODO:
 //
@@ -394,16 +399,16 @@ impl OutQueue {
     }
 
     /// Push data into the outbound queue
-    pub fn write(&mut self, mut src: &[u8]) -> io::Result<usize> {
+    pub fn poll_write(&mut self, mut src: &[u8]) -> Poll<usize> {
         if src.is_empty() {
-            return Ok(0);
+            return Poll::Ready(0);
         }
 
         let mut rem = self.remaining_capacity();
         let mut len = 0;
 
         if rem == 0 {
-            return Err(io::ErrorKind::WouldBlock.into());
+            return Poll::Pending;
         }
 
         trace!("write; remaining={:?}; src={:?}", rem, src.len());
@@ -425,10 +430,10 @@ impl OutQueue {
         }
 
         if len == 0 {
-            return Err(io::ErrorKind::WouldBlock.into());
+            return Poll::Pending;
         }
 
-        Ok(len)
+        Poll::Ready(len)
     }
 
     fn remaining_capacity(&self) -> usize {

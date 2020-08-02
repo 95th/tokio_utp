@@ -33,8 +33,7 @@ extern crate env_logger;
 mod test;
 
 pub use socket::{
-    Incoming, RawChannel, RawReceiver, UtpListener, UtpSocket, UtpSocketFinalize, UtpStream,
-    UtpStreamConnect,
+    Incoming, UtpListener, UtpSocket, UtpSocketFinalize, UtpStream, UtpStreamConnect,
 };
 
 // max window size
