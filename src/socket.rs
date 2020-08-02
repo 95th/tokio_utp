@@ -9,7 +9,12 @@ use crate::{
 
 use arraydeque::ArrayDeque;
 use bytes::{BufMut, BytesMut};
-use futures::{channel::oneshot, future::FutureExt, ready, stream::Stream};
+use futures::{
+    channel::oneshot,
+    future::FutureExt,
+    ready,
+    stream::{Stream, StreamExt},
+};
 use slab::Slab;
 use std::{
     cmp,
@@ -28,7 +33,7 @@ use std::{
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::UdpSocket,
-    time::{delay_until, Delay},
+    time::{interval, Interval},
 };
 
 #[cfg(unix)]
@@ -242,12 +247,9 @@ impl UtpSocket {
             req_finalize: finalize_tx,
         };
 
-        let next_tick = Instant::now() + Duration::from_millis(500);
-        let timeout = delay_until(next_tick.into());
         let refresher = SocketRefresher {
             inner,
-            next_tick,
-            timeout,
+            interval: interval(Duration::from_millis(500)),
             req_finalize: finalize_rx,
         };
 
@@ -1513,8 +1515,7 @@ impl Future for UtpStreamConnect {
 
 struct SocketRefresher {
     inner: InnerCell,
-    next_tick: Instant,
-    timeout: Delay,
+    interval: Interval,
     req_finalize: oneshot::Receiver<oneshot::Sender<()>>,
 }
 
@@ -1531,13 +1532,12 @@ impl Future for SocketRefresher {
 
 impl SocketRefresher {
     fn poll_inner(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
-        while let Poll::Ready(()) = self.timeout.poll_unpin(cx) {
-            unwrap!(self.inner.write()).tick(cx)?;
-            self.next_tick += Duration::from_millis(500);
-            self.timeout.reset(self.next_tick.into());
+        let mut inner = unwrap!(self.inner.write());
+        while self.interval.poll_next_unpin(cx).is_ready() {
+            inner.tick(cx)?;
         }
 
-        if let Poll::Ready(true) = unwrap!(self.inner.write()).poll_refresh(cx, &self.inner)? {
+        if let Poll::Ready(true) = inner.poll_refresh(cx, &self.inner)? {
             if 1 == Arc::strong_count(&self.inner) {
                 if let Poll::Ready(Ok(resp_finalize)) = self.req_finalize.poll_unpin(cx) {
                     let _ = resp_finalize.send(());
